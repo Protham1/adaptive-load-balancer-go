@@ -1,13 +1,13 @@
 package main
 
 import (
+	"adaptive-load/strategy"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -34,10 +34,33 @@ func (b *Backend) IsAlive() bool {
 	return alive
 }
 
-// ServerPool maintains information of all backends
+// ServerPool maintains information of all backends and active selection strategy
 type ServerPool struct {
 	backends []*Backend
-	current  uint64
+	strategy strategy.SelectionStrategy[*Backend]
+}
+
+// NewServerPool creates a new ServerPool with the specified SelectionStrategy.
+// If strat is nil, it defaults to Round-Robin.
+func NewServerPool(strat strategy.SelectionStrategy[*Backend]) *ServerPool {
+	if strat == nil {
+		strat = strategy.NewRoundRobin[*Backend]()
+	}
+	return &ServerPool{
+		strategy: strat,
+	}
+}
+
+// SetStrategy updates the selection strategy dynamically
+func (s *ServerPool) SetStrategy(strat strategy.SelectionStrategy[*Backend]) {
+	if strat != nil {
+		s.strategy = strat
+	}
+}
+
+// GetStrategy returns the active selection strategy
+func (s *ServerPool) GetStrategy() strategy.SelectionStrategy[*Backend] {
+	return s.strategy
 }
 
 // AddBackend adds a new backend server to the pool
@@ -45,32 +68,12 @@ func (s *ServerPool) AddBackend(b *Backend) {
 	s.backends = append(s.backends, b)
 }
 
-// NextIndex atomically increments current index and returns next backend index
-func (s *ServerPool) NextIndex() int {
-	if len(s.backends) == 0 {
-		return 0
-	}
-	return int(atomic.AddUint64(&s.current, uint64(1)) % uint64(len(s.backends)))
-}
-
-// GetNextPeer returns next active peer to execute a request
+// GetNextPeer returns next active peer to execute a request via the active strategy
 func (s *ServerPool) GetNextPeer() *Backend {
-	if len(s.backends) == 0 {
-		return nil
+	if s.strategy == nil {
+		s.strategy = strategy.NewRoundRobin[*Backend]()
 	}
-
-	next := s.NextIndex()
-	l := len(s.backends) + next
-	for i := next; i < l; i++ {
-		idx := i % len(s.backends)
-		if s.backends[idx].IsAlive() {
-			if i != next {
-				atomic.StoreUint64(&s.current, uint64(idx))
-			}
-			return s.backends[idx]
-		}
-	}
-	return nil
+	return s.strategy.SelectNextBackend(s.backends)
 }
 
 // HealthCheck pings backends concurrently and updates status

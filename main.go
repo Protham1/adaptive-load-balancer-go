@@ -1,6 +1,7 @@
 package main
 
 import (
+	"adaptive-load/strategy"
 	"log"
 	"net/http"
 	"net/url"
@@ -27,8 +28,11 @@ func main() {
 	// Brief pause to allow backend servers to bind to ports
 	time.Sleep(100 * time.Millisecond)
 
-	// 2. Initialize Server Pool with Backends
-	var serverPool ServerPool
+	// 2. Initialize Server Pool with Round-Robin Strategy
+	roundRobin := strategy.NewRoundRobin[*Backend]()
+	serverPool := NewServerPool(roundRobin)
+	log.Printf("Active Load Balancing Strategy: %s", serverPool.GetStrategy().Name())
+
 	for _, cfg := range backendConfigs {
 		u, err := url.Parse("http://localhost:" + cfg.Port)
 		if err != nil {
@@ -51,7 +55,7 @@ func main() {
 	lbPort := "8080"
 	server := &http.Server{
 		Addr:    ":" + lbPort,
-		Handler: lbHandler(&serverPool),
+		Handler: lbHandler(serverPool),
 	}
 
 	log.Printf("Load Balancer is running on http://localhost:%s", lbPort)
