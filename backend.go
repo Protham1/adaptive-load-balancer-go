@@ -73,20 +73,31 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	return nil
 }
 
-// HealthCheck pings backends and updates status
+// HealthCheck pings backends concurrently and updates status
 func (s *ServerPool) HealthCheck() {
+	var wg sync.WaitGroup
+
 	for _, b := range s.backends {
-		alive := isBackendAlive(b.URL)
-		wasAlive := b.IsAlive()
-		b.SetAlive(alive)
-		if wasAlive != alive {
-			if alive {
-				log.Printf("[HealthCheck] Backend %s status changed to -> UP", b.URL)
-			} else {
-				log.Printf("[HealthCheck] Backend %s status changed to -> DOWN", b.URL)
+		wg.Add(1)
+
+		go func(b *Backend) {
+			defer wg.Done()
+
+			alive := isBackendAlive(b.URL)
+			wasAlive := b.IsAlive()
+			b.SetAlive(alive)
+
+			if wasAlive != alive {
+				if alive {
+					log.Printf("[HealthCheck] Backend %s status changed to -> UP", b.URL)
+				} else {
+					log.Printf("[HealthCheck] Backend %s status changed to -> DOWN", b.URL)
+				}
 			}
-		}
+		}(b)
 	}
+
+	wg.Wait()
 }
 
 // isBackendAlive checks backend availability via TCP ping
