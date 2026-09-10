@@ -8,15 +8,18 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Backend holds the data about a server backend
 type Backend struct {
-	URL          *url.URL
-	Alive        bool
-	mux          sync.RWMutex
-	ReverseProxy *httputil.ReverseProxy
+	URL               *url.URL
+	Alive             bool
+	mux               sync.RWMutex
+	ReverseProxy      *httputil.ReverseProxy
+	weight            int
+	activeConnections int64
 }
 
 // SetAlive sets the liveness state of the backend thread-safely
@@ -32,6 +35,46 @@ func (b *Backend) IsAlive() bool {
 	alive := b.Alive
 	b.mux.RUnlock()
 	return alive
+}
+
+// IncConns atomically increments active in-flight connections
+func (b *Backend) IncConns() int64 {
+	return atomic.AddInt64(&b.activeConnections, 1)
+}
+
+// DecConns atomically decrements active in-flight connections
+func (b *Backend) DecConns() int64 {
+	return atomic.AddInt64(&b.activeConnections, -1)
+}
+
+// GetActiveConnections returns the count of active in-flight connections
+func (b *Backend) GetActiveConnections() int64 {
+	return atomic.LoadInt64(&b.activeConnections)
+}
+
+// GetWeight returns the capacity weight of the backend (minimum 1)
+func (b *Backend) GetWeight() int {
+	b.mux.RLock()
+	defer b.mux.RUnlock()
+	if b.weight <= 0 {
+		return 1
+	}
+	return b.weight
+}
+
+// SetWeight updates the capacity weight of the backend thread-safely
+func (b *Backend) SetWeight(weight int) {
+	b.mux.Lock()
+	b.weight = weight
+	b.mux.Unlock()
+}
+
+// GetID returns the string identifier of the backend (URL string) for consistent hashing
+func (b *Backend) GetID() string {
+	if b.URL == nil {
+		return ""
+	}
+	return b.URL.String()
 }
 
 // ServerPool maintains information of all backends and active selection strategy
@@ -76,6 +119,17 @@ func (s *ServerPool) GetNextPeer() *Backend {
 	return s.strategy.SelectNextBackend(s.backends)
 }
 
+// GetNextPeerWithKey returns next active peer considering a routing key (e.g. Client IP)
+func (s *ServerPool) GetNextPeerWithKey(key string) *Backend {
+	if s.strategy == nil {
+		s.strategy = strategy.NewRoundRobin[*Backend]()
+	}
+	if keyed, ok := s.strategy.(strategy.KeyedSelectionStrategy[*Backend]); ok {
+		return keyed.SelectNextBackendWithKey(s.backends, key)
+	}
+	return s.strategy.SelectNextBackend(s.backends)
+}
+
 // HealthCheck pings backends concurrently and updates status
 func (s *ServerPool) HealthCheck() {
 	var wg sync.WaitGroup
@@ -114,13 +168,19 @@ func isBackendAlive(u *url.URL) bool {
 	return true
 }
 
-// NewBackend constructs a Backend with a ReverseProxy
+// NewBackend constructs a Backend with default weight 1 and a ReverseProxy
 func NewBackend(u *url.URL) *Backend {
+	return NewBackendWithWeight(u, 1)
+}
+
+// NewBackendWithWeight constructs a Backend with specified weight and a ReverseProxy
+func NewBackendWithWeight(u *url.URL, weight int) *Backend {
 	proxy := httputil.NewSingleHostReverseProxy(u)
 	b := &Backend{
 		URL:          u,
 		Alive:        true,
 		ReverseProxy: proxy,
+		weight:       weight,
 	}
 
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {

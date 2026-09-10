@@ -13,12 +13,13 @@ func main() {
 
 	// 1. Start 3 Dummy Backend HTTP Servers on different ports
 	backendConfigs := []struct {
-		Port string
-		Name string
+		Port   string
+		Name   string
+		Weight int
 	}{
-		{Port: "8081", Name: "Backend-1"},
-		{Port: "8082", Name: "Backend-2"},
-		{Port: "8083", Name: "Backend-3"},
+		{Port: "8081", Name: "Backend-1", Weight: 3},
+		{Port: "8082", Name: "Backend-2", Weight: 2},
+		{Port: "8083", Name: "Backend-3", Weight: 1},
 	}
 
 	for _, cfg := range backendConfigs {
@@ -28,9 +29,14 @@ func main() {
 	// Brief pause to allow backend servers to bind to ports
 	time.Sleep(100 * time.Millisecond)
 
-	// 2. Initialize Server Pool with Round-Robin Strategy
-	roundRobin := strategy.NewRoundRobin[*Backend]()
-	serverPool := NewServerPool(roundRobin)
+	// 2. Initialize Server Pool with Round-Robin Strategy (can switch to Least-Connections, Smooth-Weighted-Round-Robin, Consistent-Hash)
+	// Example options:
+	// - strategy.NewRoundRobin[*Backend]()
+	// - strategy.NewLeastConnections[*Backend]()
+	// - strategy.NewSmoothWeightedRoundRobin[*Backend]()
+	// - strategy.NewConsistentHash[*Backend](100)
+	activeStrategy := strategy.NewRoundRobin[*Backend]()
+	serverPool := NewServerPool(activeStrategy)
 	log.Printf("Active Load Balancing Strategy: %s", serverPool.GetStrategy().Name())
 
 	for _, cfg := range backendConfigs {
@@ -38,9 +44,9 @@ func main() {
 		if err != nil {
 			log.Fatalf("Invalid backend URL: %v", err)
 		}
-		b := NewBackend(u)
+		b := NewBackendWithWeight(u, cfg.Weight)
 		serverPool.AddBackend(b)
-		log.Printf("Configured Backend: %s", u.String())
+		log.Printf("Configured Backend: %s (Weight: %d)", u.String(), cfg.Weight)
 	}
 
 	// 3. Start Periodic Background Health Check
