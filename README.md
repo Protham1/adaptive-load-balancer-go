@@ -131,3 +131,37 @@ Execute all unit and integration tests:
 ```bash
 go test -v ./...
 ```
+
+---
+
+## 🖥️ Live Interactive Frontend Visualizer (`frontend/`)
+
+A dedicated, real-time React + Vite dashboard is available to visualize incoming requests, traffic flow, live node metrics, and test strategy switching.
+
+### Features
+- **Live SVG Topology**: Glowing particle rays animate in real-time along curved paths from Client $\to$ Load Balancer $\to$ Backend.
+- **Traffic Generator**: Fire single probes, bursts (10/25 reqs), or stream continuous load (1-20 req/s).
+- **Latency Delay Injector**: Artificially slow down backends to observe **Least Connections** routing around busy servers in real time.
+- **Client IP Selector**: Test **Consistent Hashing** sticky session affinity across different client keys.
+- **Chaos Mode (`Kill / Revive`)**: Simulate backend node crashes and watch failover live.
+- **Server Capacity Weight Sliders**: Adjust node weights dynamically to see **Smooth Weighted Round-Robin** in action.
+
+### Launching the Dashboard
+
+#### Standalone Production Mode (Direct from Go)
+The frontend bundle is built in `frontend/dist`. Simply start the load balancer:
+```bash
+go run .
+```
+Navigate to **[http://localhost:8080/](http://localhost:8080/)** in your browser.
+
+#### Frontend Development Mode (Hot Reloading)
+```bash
+# Terminal 1: Go backend
+go run .
+
+# Terminal 2: React dev server
+cd frontend
+npm run dev
+```
+Navigate to **[http://localhost:5173/](http://localhost:5173/)** in your browser.

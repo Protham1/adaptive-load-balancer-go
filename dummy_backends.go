@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"sync/atomic"
+	"time"
 )
 
 // StartDummyBackend launches an HTTP server on the given port for demonstration purposes
@@ -13,6 +14,17 @@ func StartDummyBackend(port string, name string) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Optional simulated processing delay for testing Least Connections
+		if delayStr := r.Header.Get("X-Simulated-Delay"); delayStr != "" {
+			if d, err := time.ParseDuration(delayStr); err == nil {
+				time.Sleep(d)
+			}
+		} else if delayStr := r.URL.Query().Get("delay"); delayStr != "" {
+			if d, err := time.ParseDuration(delayStr); err == nil {
+				time.Sleep(d)
+			}
+		}
+
 		count := atomic.AddUint64(&requestCount, 1)
 		msg := fmt.Sprintf("Response from %s (Port %s) | Request Count: %d\n", name, port, count)
 		log.Printf("[%s] Handled request #%d", name, count)

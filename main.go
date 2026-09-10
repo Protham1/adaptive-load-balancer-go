@@ -39,14 +39,16 @@ func main() {
 	serverPool := NewServerPool(activeStrategy)
 	log.Printf("Active Load Balancing Strategy: %s", serverPool.GetStrategy().Name())
 
+	eventBus := NewEventBus()
+
 	for _, cfg := range backendConfigs {
 		u, err := url.Parse("http://localhost:" + cfg.Port)
 		if err != nil {
 			log.Fatalf("Invalid backend URL: %v", err)
 		}
-		b := NewBackendWithWeight(u, cfg.Weight)
+		b := NewBackendNamedWithWeight(u, cfg.Name, cfg.Weight)
 		serverPool.AddBackend(b)
-		log.Printf("Configured Backend: %s (Weight: %d)", u.String(), cfg.Weight)
+		log.Printf("Configured Backend: %s (%s, Weight: %d)", cfg.Name, u.String(), cfg.Weight)
 	}
 
 	// 3. Start Periodic Background Health Check
@@ -61,10 +63,11 @@ func main() {
 	lbPort := "8080"
 	server := &http.Server{
 		Addr:    ":" + lbPort,
-		Handler: lbHandler(serverPool),
+		Handler: lbHandler(serverPool, eventBus),
 	}
 
 	log.Printf("Load Balancer is running on http://localhost:%s", lbPort)
+	log.Printf("Interactive Dashboard available at http://localhost:5173 (Dev) or http://localhost:%s/ (Production)", lbPort)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Load Balancer error: %v", err)
 	}
