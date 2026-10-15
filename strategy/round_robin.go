@@ -31,9 +31,6 @@ func (r *RoundRobinStrategy[T]) SelectNextBackend(peers []T) T {
 	for i := next; i < l; i++ {
 		idx := i % len(peers)
 		if peers[idx].IsAlive() {
-			if i != next {
-				atomic.StoreUint64(&r.current, uint64(idx))
-			}
 			return peers[idx]
 		}
 	}
