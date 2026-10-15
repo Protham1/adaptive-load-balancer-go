@@ -127,10 +127,21 @@ curl http://localhost:8080
 ```
 
 ### Running Tests
-Execute all unit and integration tests:
+Execute all unit, concurrency, and integration tests:
 ```bash
 go test -v ./...
 ```
+
+### Running Repeatable Benchmarks
+Execute the automated multi-worker baseline benchmark:
+```bash
+go run ./cmd/bench
+```
+Or run the Go micro-benchmarks:
+```bash
+go test -run=^$ -bench=. -benchmem ./...
+```
+See [BASELINE.md](BASELINE.md) for full hardware specifications and raw benchmark tables.
 
 ---
 

@@ -141,18 +141,39 @@ func (s *ServerPool) GetStrategy() strategy.SelectionStrategy[*Backend] {
 	return s.strategy
 }
 
-// AddBackend adds a new backend server to the pool
+// AddBackend adds a new backend server to the pool thread-safely
 func (s *ServerPool) AddBackend(b *Backend) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
 	s.backends = append(s.backends, b)
 }
 
-// GetAllBackends returns a slice of all configured backends
-func (s *ServerPool) GetAllBackends() []*Backend {
-	return s.backends
+// RemoveBackend removes a backend server from the pool by its Name or URL string thread-safely
+func (s *ServerPool) RemoveBackend(identifier string) bool {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	for i, b := range s.backends {
+		if b.Name == identifier || (b.URL != nil && b.URL.String() == identifier) {
+			s.backends = append(s.backends[:i], s.backends[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
-// GetBackendByName finds a backend by its configured Name
+// GetAllBackends returns a snapshot copy slice of all configured backends
+func (s *ServerPool) GetAllBackends() []*Backend {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	cp := make([]*Backend, len(s.backends))
+	copy(cp, s.backends)
+	return cp
+}
+
+// GetBackendByName finds a backend by its configured Name thread-safely
 func (s *ServerPool) GetBackendByName(name string) *Backend {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
 	for _, b := range s.backends {
 		if b.Name == name {
 			return b
@@ -165,34 +186,43 @@ func (s *ServerPool) GetBackendByName(name string) *Backend {
 func (s *ServerPool) GetNextPeer() *Backend {
 	s.mux.RLock()
 	strat := s.strategy
+	backends := make([]*Backend, len(s.backends))
+	copy(backends, s.backends)
 	s.mux.RUnlock()
 
 	if strat == nil {
 		strat = strategy.NewRoundRobin[*Backend]()
 	}
-	return strat.SelectNextBackend(s.backends)
+	return strat.SelectNextBackend(backends)
 }
 
 // GetNextPeerWithKey returns next active peer considering a routing key (e.g. Client IP)
 func (s *ServerPool) GetNextPeerWithKey(key string) *Backend {
 	s.mux.RLock()
 	strat := s.strategy
+	backends := make([]*Backend, len(s.backends))
+	copy(backends, s.backends)
 	s.mux.RUnlock()
 
 	if strat == nil {
 		strat = strategy.NewRoundRobin[*Backend]()
 	}
 	if keyed, ok := strat.(strategy.KeyedSelectionStrategy[*Backend]); ok {
-		return keyed.SelectNextBackendWithKey(s.backends, key)
+		return keyed.SelectNextBackendWithKey(backends, key)
 	}
-	return strat.SelectNextBackend(s.backends)
+	return strat.SelectNextBackend(backends)
 }
 
 // HealthCheck pings backends concurrently and updates status
 func (s *ServerPool) HealthCheck() {
+	s.mux.RLock()
+	backends := make([]*Backend, len(s.backends))
+	copy(backends, s.backends)
+	s.mux.RUnlock()
+
 	var wg sync.WaitGroup
 
-	for _, b := range s.backends {
+	for _, b := range backends {
 		wg.Add(1)
 
 		go func(b *Backend) {

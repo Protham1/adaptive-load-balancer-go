@@ -117,23 +117,26 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 		})
 
 		start := time.Now()
-		peer.ReverseProxy.ServeHTTP(w, r)
-		duration := time.Since(start).Milliseconds()
-		peer.DecConns()
+		defer func() {
+			conns := peer.DecConns()
+			duration := time.Since(start).Milliseconds()
 
-		// Broadcast complete event
-		eventBus.Publish(RequestEvent{
-			ID:          reqID,
-			Type:        "complete",
-			ClientIP:    clientIP,
-			BackendURL:  peer.URL.String(),
-			BackendName: peer.Name,
-			Strategy:    stratName,
-			ActiveConns: peer.GetActiveConnections(),
-			DurationMs:  duration,
-			Status:      http.StatusOK,
-			Timestamp:   time.Now().UnixMilli(),
-		})
+			// Broadcast complete event
+			eventBus.Publish(RequestEvent{
+				ID:          reqID,
+				Type:        "complete",
+				ClientIP:    clientIP,
+				BackendURL:  peer.URL.String(),
+				BackendName: peer.Name,
+				Strategy:    stratName,
+				ActiveConns: conns,
+				DurationMs:  duration,
+				Status:      http.StatusOK,
+				Timestamp:   time.Now().UnixMilli(),
+			})
+		}()
+
+		peer.ReverseProxy.ServeHTTP(w, r)
 	}
 }
 
@@ -275,6 +278,22 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		})
 
 		start := time.Now()
+		defer func() {
+			conns := peer.DecConns()
+			eventBus.Publish(RequestEvent{
+				ID:          reqID,
+				Type:        "complete",
+				ClientIP:    clientIP,
+				BackendURL:  peer.URL.String(),
+				BackendName: peer.Name,
+				Strategy:    stratName,
+				ActiveConns: conns,
+				DurationMs:  time.Since(start).Milliseconds(),
+				Status:      http.StatusOK,
+				Timestamp:   time.Now().UnixMilli(),
+			})
+		}()
+
 		// If custom delay requested, forward to backend with X-Simulated-Delay
 		targetURL := peer.URL.String()
 		if body.Delay != "" {
@@ -292,21 +311,6 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		}
 
 		duration := time.Since(start).Milliseconds()
-		peer.DecConns()
-
-		eventBus.Publish(RequestEvent{
-			ID:          reqID,
-			Type:        "complete",
-			ClientIP:    clientIP,
-			BackendURL:  peer.URL.String(),
-			BackendName: peer.Name,
-			Strategy:    stratName,
-			ActiveConns: peer.GetActiveConnections(),
-			DurationMs:  duration,
-			Status:      http.StatusOK,
-			Timestamp:   time.Now().UnixMilli(),
-		})
-
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"id":           reqID,
