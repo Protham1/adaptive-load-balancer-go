@@ -1,6 +1,7 @@
 package main
 
 import (
+	"adaptive-load/metrics"
 	"adaptive-load/strategy"
 	"log"
 	"net/http"
@@ -29,14 +30,13 @@ func main() {
 	// Brief pause to allow backend servers to bind to ports
 	time.Sleep(100 * time.Millisecond)
 
-	// 2. Initialize Server Pool with Round-Robin Strategy (can switch to Least-Connections, Smooth-Weighted-Round-Robin, Consistent-Hash)
-	// Example options:
-	// - strategy.NewRoundRobin[*Backend]()
-	// - strategy.NewLeastConnections[*Backend]()
-	// - strategy.NewSmoothWeightedRoundRobin[*Backend]()
-	// - strategy.NewConsistentHash[*Backend](100)
+	// 2. Initialize Metrics Collector with 10s sliding aggregation window
+	metricsCollector := metrics.NewMetricsCollector(10 * time.Second)
+
+	// 3. Initialize Server Pool with Round-Robin Strategy
 	activeStrategy := strategy.NewRoundRobin[*Backend]()
 	serverPool := NewServerPool(activeStrategy)
+	serverPool.SetCollector(metricsCollector)
 	log.Printf("Active Load Balancing Strategy: %s", serverPool.GetStrategy().Name())
 
 	eventBus := NewEventBus()
@@ -48,6 +48,7 @@ func main() {
 		}
 		b := NewBackendNamedWithWeight(u, cfg.Name, cfg.Weight)
 		serverPool.AddBackend(b)
+		metricsCollector.RegisterBackend(cfg.Name, u.String(), cfg.Weight, 4, 1024*1024*512, 100)
 		log.Printf("Configured Backend: %s (%s, Weight: %d)", cfg.Name, u.String(), cfg.Weight)
 	}
 
@@ -67,6 +68,7 @@ func main() {
 	}
 
 	log.Printf("Load Balancer is running on http://localhost:%s", lbPort)
+	log.Printf("Metrics API contract available at http://localhost:%s/api/metrics", lbPort)
 	log.Printf("Interactive Dashboard available at http://localhost:5173 (Dev) or http://localhost:%s/ (Production)", lbPort)
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Load Balancer error: %v", err)

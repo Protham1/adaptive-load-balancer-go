@@ -55,21 +55,32 @@ A high-performance, modular HTTP reverse-proxy load balancer built with Go's sta
 
 ```text
 adaptive-load/
+├── metrics/                        # Phase 1 Metrics Contract package
+│   ├── types.go                    # Metric schemas, OptionalFloat, units, serialization
+│   ├── collector.go                # Central MetricsCollector coordinating all metric groups
+│   ├── request_tracker.go          # Hot-path atomic counters, error classification, in-flight conns
+│   ├── latency_histogram.go        # Bounded circular reservoir + histogram (p50/p90/p95/p99)
+│   ├── window.go                   # Sliding time window aggregator & monotonic rate tracker
+│   ├── host_metrics.go             # Process memory, GC stats, and CPU pressure
+│   ├── backend_probe.go            # Health check probe latency & status tracking
+│   └── normalize.go                # MinMax/ZScore normalization & ML feature vectors
 ├── strategy/
 │   ├── strategy.go                 # Generic SelectionStrategy & Peer sub-interfaces
 │   ├── round_robin.go              # Atomic Round-Robin algorithm
 │   ├── round_robin_test.go         # Round-Robin unit tests
-│   ├── least_connections.go       # Least Connections with round-robin tie-breaking
-│   ├── least_connections_test.go  # Least Connections unit tests
+│   ├── least_connections.go        # Least Connections with round-robin tie-breaking
+│   ├── least_connections_test.go   # Least Connections unit tests
 │   ├── weighted_round_robin.go     # Nginx Smooth Weighted Round-Robin
 │   ├── weighted_round_robin_test.go# SWRR unit tests
 │   ├── consistent_hash.go          # Ketama Hash Ring with virtual nodes (IP affinity)
 │   └── consistent_hash_test.go     # Consistent Hash unit tests
-├── backend.go                      # Backend struct, active connections, weights, ServerPool, health checker
+├── backend.go                      # Backend struct, ServerPool, health checker, probe integration
 ├── dummy_backends.go               # Lightweight test HTTP servers (ports 8081, 8082, 8083)
-├── lb.go                           # HTTP reverse proxy request handler with connection tracking & IP routing
-├── lb_test.go                      # End-to-end load balancer integration tests
+├── lb.go                           # HTTP reverse proxy, metrics telemetry, /api/metrics endpoint
+├── lb_test.go                      # Integration tests, connection integrity, metrics API tests
 ├── main.go                         # Application bootstrap and entrypoint
+├── BASELINE.md                     # Phase 0 Baseline Performance & Hardware Report
+├── METRICS.md                      # Phase 1 Metrics Contract & Telemetry Schema Specification
 └── go.mod                          # Go module definition
 ```
 
@@ -142,6 +153,24 @@ Or run the Go micro-benchmarks:
 go test -run=^$ -bench=. -benchmem ./...
 ```
 See [BASELINE.md](BASELINE.md) for full hardware specifications and raw benchmark tables.
+
+---
+
+## 📊 Phase 1 Metrics Contract (`metrics/`)
+
+The Load Balancer implements a formal metrics contract adhering to strict telemetry quality rules:
+* **Metric Groups**: Per-Backend Runtime, Host/Resource, Global Traffic, Capacity/Config, and Controller behavior.
+* **Sliding Window Aggregation**: Monotonic atomic counters with interval rate derivations (`RollingWindow`).
+* **Percentile Distributions**: Bounded circular reservoir with log-spaced buckets computing exact `p50`, `p90`, `p95`, `p99` without averaging latencies.
+* **Consistent Failure Classification**: Classifies failures into `http_5xx`, `transport`, `timeout`, and `cancellation`.
+* **Explicit Missing Values**: Missing hardware readings are explicitly represented as `null` via `OptionalFloat` (never defaulting silently to 0.0).
+* **Machine Learning Normalization**: Prepares MinMax/Z-Score normalized feature vectors for adaptive AI policies.
+
+Query the live metrics schema:
+```bash
+curl http://localhost:8080/api/metrics
+```
+See [METRICS.md](METRICS.md) for complete schema specifications and JSON definitions.
 
 ---
 

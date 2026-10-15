@@ -1,8 +1,10 @@
 package main
 
 import (
+	"adaptive-load/metrics"
 	"adaptive-load/strategy"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -446,5 +448,57 @@ func TestConcurrentStrategySwitching(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+func TestMetricsAPIEndpoint(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+
+	u, _ := url.Parse(ts.URL)
+	b := NewBackend(u)
+	b.Name = "Test-Backend-1"
+
+	col := metrics.NewMetricsCollector(10 * time.Second)
+	pool := NewServerPool(strategy.NewRoundRobin[*Backend]())
+	pool.SetCollector(col)
+	pool.AddBackend(b)
+
+	handler := lbHandler(pool)
+
+	// Send a proxy request through lb
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	// Request /api/metrics
+	metricsReq := httptest.NewRequest(http.MethodGet, "/api/metrics", nil)
+	metricsRec := httptest.NewRecorder()
+	handler.ServeHTTP(metricsRec, metricsReq)
+
+	if metricsRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/metrics, got %d", metricsRec.Code)
+	}
+
+	var snapshot metrics.MetricsSnapshot
+	if err := json.Unmarshal(metricsRec.Body.Bytes(), &snapshot); err != nil {
+		t.Fatalf("failed to decode metrics JSON: %v", err)
+	}
+
+	if snapshot.GlobalTraffic.TotalRequests != 1 {
+		t.Errorf("expected 1 global request, got %d", snapshot.GlobalTraffic.TotalRequests)
+	}
+	if snapshot.Controller.CurrentStrategy != "Round-Robin" {
+		t.Errorf("expected Round-Robin, got %s", snapshot.Controller.CurrentStrategy)
+	}
+	if snapshot.Backends[b.Name] == nil {
+		t.Errorf("expected metrics for backend %s, got nil", b.Name)
+	}
 }
 

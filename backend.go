@@ -1,6 +1,7 @@
 package main
 
 import (
+	"adaptive-load/metrics"
 	"adaptive-load/strategy"
 	"fmt"
 	"log"
@@ -92,9 +93,10 @@ func (b *Backend) GetID() string {
 
 // ServerPool maintains information of all backends and active selection strategy
 type ServerPool struct {
-	backends []*Backend
-	strategy strategy.SelectionStrategy[*Backend]
-	mux      sync.RWMutex
+	backends  []*Backend
+	strategy  strategy.SelectionStrategy[*Backend]
+	collector *metrics.MetricsCollector
+	mux       sync.RWMutex
 }
 
 // NewServerPool creates a new ServerPool with the specified SelectionStrategy.
@@ -108,12 +110,32 @@ func NewServerPool(strat strategy.SelectionStrategy[*Backend]) *ServerPool {
 	}
 }
 
+// SetCollector attaches a metrics collector to the server pool.
+func (s *ServerPool) SetCollector(col *metrics.MetricsCollector) {
+	s.mux.Lock()
+	s.collector = col
+	s.mux.Unlock()
+}
+
+// GetCollector returns the attached metrics collector if any.
+func (s *ServerPool) GetCollector() *metrics.MetricsCollector {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return s.collector
+}
+
 // SetStrategy updates the selection strategy dynamically
 func (s *ServerPool) SetStrategy(strat strategy.SelectionStrategy[*Backend]) {
 	if strat != nil {
+		start := time.Now()
 		s.mux.Lock()
 		s.strategy = strat
+		col := s.collector
 		s.mux.Unlock()
+
+		if col != nil {
+			col.RecordStrategySwitch(strat.Name(), time.Since(start))
+		}
 	}
 }
 
@@ -144,21 +166,35 @@ func (s *ServerPool) GetStrategy() strategy.SelectionStrategy[*Backend] {
 // AddBackend adds a new backend server to the pool thread-safely
 func (s *ServerPool) AddBackend(b *Backend) {
 	s.mux.Lock()
-	defer s.mux.Unlock()
 	s.backends = append(s.backends, b)
+	col := s.collector
+	s.mux.Unlock()
+
+	if col != nil {
+		col.RegisterBackend(b.Name, b.URL.String(), b.GetWeight(), 2, 1024*1024*512, 100)
+	}
 }
 
 // RemoveBackend removes a backend server from the pool by its Name or URL string thread-safely
 func (s *ServerPool) RemoveBackend(identifier string) bool {
 	s.mux.Lock()
-	defer s.mux.Unlock()
+	var removedName string
+	var found bool
 	for i, b := range s.backends {
 		if b.Name == identifier || (b.URL != nil && b.URL.String() == identifier) {
+			removedName = b.Name
 			s.backends = append(s.backends[:i], s.backends[i+1:]...)
-			return true
+			found = true
+			break
 		}
 	}
-	return false
+	col := s.collector
+	s.mux.Unlock()
+
+	if found && col != nil {
+		col.UnregisterBackend(removedName)
+	}
+	return found
 }
 
 // GetAllBackends returns a snapshot copy slice of all configured backends
@@ -218,6 +254,7 @@ func (s *ServerPool) HealthCheck() {
 	s.mux.RLock()
 	backends := make([]*Backend, len(s.backends))
 	copy(backends, s.backends)
+	col := s.collector
 	s.mux.RUnlock()
 
 	var wg sync.WaitGroup
@@ -228,9 +265,16 @@ func (s *ServerPool) HealthCheck() {
 		go func(b *Backend) {
 			defer wg.Done()
 
-			alive := isBackendAlive(b.URL)
+			start := time.Now()
+			alive, err := pingBackend(b.URL)
+			dur := time.Since(start)
+
 			wasAlive := b.IsAlive()
 			b.SetAlive(alive)
+
+			if col != nil {
+				col.RecordProbe(b.Name, alive, dur, err)
+			}
 
 			if wasAlive != alive {
 				if alive {
@@ -245,15 +289,21 @@ func (s *ServerPool) HealthCheck() {
 	wg.Wait()
 }
 
-// isBackendAlive checks backend availability via TCP ping
-func isBackendAlive(u *url.URL) bool {
+// pingBackend checks backend availability via TCP ping and returns probe error
+func pingBackend(u *url.URL) (bool, error) {
 	timeout := 2 * time.Second
 	conn, err := net.DialTimeout("tcp", u.Host, timeout)
 	if err != nil {
-		return false
+		return false, err
 	}
 	_ = conn.Close()
-	return true
+	return true, nil
+}
+
+// isBackendAlive checks backend availability via TCP ping
+func isBackendAlive(u *url.URL) bool {
+	alive, _ := pingBackend(u)
+	return alive
 }
 
 // NewBackend constructs a Backend with default weight 1 and a ReverseProxy

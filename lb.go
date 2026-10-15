@@ -1,6 +1,7 @@
 package main
 
 import (
+	"adaptive-load/metrics"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -36,6 +37,26 @@ func enableCORS(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Forwarded-For, X-Simulated-Delay, X-Real-IP")
+}
+
+type statusCapturingResponseWriter struct {
+	http.ResponseWriter
+	statusCode   int
+	bytesWritten uint64
+}
+
+func (s *statusCapturingResponseWriter) WriteHeader(code int) {
+	s.statusCode = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusCapturingResponseWriter) Write(b []byte) (int, error) {
+	if s.statusCode == 0 {
+		s.statusCode = http.StatusOK
+	}
+	n, err := s.ResponseWriter.Write(b)
+	s.bytesWritten += uint64(n)
+	return n, err
 }
 
 // statusResponse represents the server pool status
@@ -116,10 +137,34 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 			Timestamp:   time.Now().UnixMilli(),
 		})
 
+		col := pool.GetCollector()
+		var activeReq *metrics.ActiveRequest
+		if col != nil {
+			activeReq = col.RecordRequestStart(peer.Name, r.Method, r.URL.Path)
+		}
+
+		inBytes := uint64(0)
+		if r.ContentLength > 0 {
+			inBytes = uint64(r.ContentLength)
+		}
+		capturedWriter := &statusCapturingResponseWriter{ResponseWriter: w}
+
 		start := time.Now()
 		defer func() {
 			conns := peer.DecConns()
 			duration := time.Since(start).Milliseconds()
+
+			status := capturedWriter.statusCode
+			if status == 0 {
+				status = http.StatusOK
+			}
+			var reqErr error
+			if status >= 500 {
+				reqErr = fmt.Errorf("http error %d", status)
+			}
+			if col != nil {
+				col.RecordRequestEnd(peer.Name, activeReq, status, reqErr, inBytes, capturedWriter.bytesWritten)
+			}
 
 			// Broadcast complete event
 			eventBus.Publish(RequestEvent{
@@ -131,12 +176,12 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 				Strategy:    stratName,
 				ActiveConns: conns,
 				DurationMs:  duration,
-				Status:      http.StatusOK,
+				Status:      status,
 				Timestamp:   time.Now().UnixMilli(),
 			})
 		}()
 
-		peer.ReverseProxy.ServeHTTP(w, r)
+		peer.ReverseProxy.ServeHTTP(capturedWriter, r)
 	}
 }
 
@@ -215,6 +260,15 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		log.Printf("[LoadBalancer] Updated %s weight -> %d", b.Name, b.GetWeight())
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"name": b.Name, "weight": b.GetWeight()})
+
+	case r.URL.Path == "/api/metrics" && r.Method == http.MethodGet:
+		col := pool.GetCollector()
+		if col == nil {
+			http.Error(w, `{"error":"metrics collector not configured"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(col.CollectSnapshot())
 
 	case r.URL.Path == "/api/events" && r.Method == http.MethodGet:
 		flusher, ok := w.(http.Flusher)
