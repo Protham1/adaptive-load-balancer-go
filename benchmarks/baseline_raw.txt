@@ -1,4 +1,4 @@
-Timestamp: 2026-10-15T23:33:08+05:30
+Timestamp: 2026-10-16T00:00:22+05:30
 Go: go1.27.1
 OS: windows
 Arch: amd64
@@ -11,7 +11,7 @@ Concurrency: 20
 
 | Strategy | Requests | Concurrency | Throughput (req/s) | Latency p50 | Latency p95 | Latency p99 | Errors | Memory Total Allocated |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Round-Robin (RR)** | 5000 | 20 | 18424.3 | 0.00 µs | 3.15 ms | 14.81 ms | 0 | 32.49 MB |
-| **Least-Connections (LC)** | 5000 | 20 | 27549.7 | 0.00 µs | 2.71 ms | 4.66 ms | 0 | 32.09 MB |
-| **Smooth-Weighted-Round-Robin (SWRR)** | 5000 | 20 | 32714.9 | 0.00 µs | 2.24 ms | 3.66 ms | 0 | 31.55 MB |
-| **Consistent-Hash (CH)** | 5000 | 20 | 25622.9 | 326.00 µs | 2.89 ms | 4.72 ms | 0 | 33.60 MB |
+| **Round-Robin (RR)** | 5000 | 20 | 17038.1 | 996.00 µs | 4.65 ms | 7.92 ms | 0 | 31.82 MB |
+| **Least-Connections (LC)** | 5000 | 20 | 31080.6 | 0.00 µs | 2.45 ms | 4.08 ms | 0 | 31.73 MB |
+| **Smooth-Weighted-Round-Robin (SWRR)** | 5000 | 20 | 27541.7 | 512.00 µs | 2.51 ms | 3.52 ms | 0 | 32.55 MB |
+| **Consistent-Hash (CH)** | 5000 | 20 | 22087.9 | 545.00 µs | 3.16 ms | 4.28 ms | 0 | 34.21 MB |
