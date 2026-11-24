@@ -261,8 +261,8 @@ func TestNormalizeUtilities(t *testing.T) {
 	b := &BackendRuntimeMetrics{
 		Healthy:     true,
 		ActiveConns: 50,
-		RPS:         500,
-		ErrorRate:   10,
+		RPS:         SmoothedValue{Raw: 500},
+		ErrorRate:   SmoothedValue{Raw: 10},
 		Latency:     LatencyStats{P95Ms: 250},
 	}
 	cap := &BackendCapacityConfig{StaticWeight: 5}
@@ -356,5 +356,224 @@ func TestMetricsCollectorConcurrency(t *testing.T) {
 	}
 	if snap.GlobalTraffic.ActiveRequests != 0 {
 		t.Errorf("expected 0 active requests, got %d", snap.GlobalTraffic.ActiveRequests)
+	}
+}
+
+func TestSingleAndMultiEMA(t *testing.T) {
+	// 1. SingleEMA with alpha = 0.1
+	ema01 := NewSingleEMA(0.1)
+	if ema01.Initialized() {
+		t.Errorf("expected new EMA to not be initialized")
+	}
+
+	// First observation initializes the EMA directly to raw value
+	v1 := ema01.Update(100.0)
+	if v1 != 100.0 || !ema01.Initialized() {
+		t.Errorf("expected first EMA value 100.0, got %f", v1)
+	}
+
+	// Second observation: EMA = 0.1 * 200 + 0.9 * 100 = 20 + 90 = 110
+	v2 := ema01.Update(200.0)
+	if v2 < 109.9 || v2 > 110.1 {
+		t.Errorf("expected EMA(0.1) ~110.0, got %f", v2)
+	}
+
+	// 2. SingleEMA with alpha = 0.5
+	ema05 := NewSingleEMA(0.5)
+	ema05.Update(100.0)
+	// Second observation: EMA = 0.5 * 200 + 0.5 * 100 = 150
+	v05_2 := ema05.Update(200.0)
+	if v05_2 < 149.9 || v05_2 > 150.1 {
+		t.Errorf("expected EMA(0.5) ~150.0, got %f", v05_2)
+	}
+
+	// 3. MultiEMA with simultaneous alpha 0.1, 0.3, 0.5
+	multi := NewMultiEMA()
+	s1 := multi.Update(50.0)
+	if s1.Raw != 50.0 || s1.EMA01 != 50.0 || s1.EMA03 != 50.0 || s1.EMA05 != 50.0 {
+		t.Errorf("unexpected initial multi-EMA: %+v", s1)
+	}
+
+	// Update with 100:
+	// EMA01: 0.1*100 + 0.9*50 = 10 + 45 = 55
+	// EMA03: 0.3*100 + 0.7*50 = 30 + 35 = 65
+	// EMA05: 0.5*100 + 0.5*50 = 50 + 25 = 75
+	s2 := multi.Update(100.0)
+	if s2.Raw != 100.0 {
+		t.Errorf("expected raw 100, got %f", s2.Raw)
+	}
+	if s2.EMA01 < 54.9 || s2.EMA01 > 55.1 {
+		t.Errorf("expected EMA01 ~55, got %f", s2.EMA01)
+	}
+	if s2.EMA03 < 64.9 || s2.EMA03 > 65.1 {
+		t.Errorf("expected EMA03 ~65, got %f", s2.EMA03)
+	}
+	if s2.EMA05 < 74.9 || s2.EMA05 > 75.1 {
+		t.Errorf("expected EMA05 ~75, got %f", s2.EMA05)
+	}
+
+	val := multi.Value()
+	if val != s2 {
+		t.Errorf("expected Value() to match latest Update(): %+v vs %+v", val, s2)
+	}
+
+	multi.Reset()
+	if multi.Value().Raw != 0 || multi.Value().EMA01 != 0 {
+		t.Errorf("expected reset MultiEMA to have zeros")
+	}
+}
+
+func TestWindowMetadataAndReliability(t *testing.T) {
+	window := NewRollingWindow(10*time.Second, 10)
+	threshold := uint64(10)
+
+	// Below threshold (5 completed requests)
+	window.Add(5)
+	meta := window.GetWindowMetadata(threshold)
+	if meta.CompletedRequests != 5 {
+		t.Errorf("expected 5 completed requests, got %d", meta.CompletedRequests)
+	}
+	if meta.IsValid {
+		t.Errorf("expected window to be invalid when below threshold")
+	}
+	if !meta.FallbackRecommended {
+		t.Errorf("expected fallback recommended when below threshold")
+	}
+	if meta.ReliabilityReason == "" {
+		t.Errorf("expected non-empty reliability reason for invalid window")
+	}
+
+	// At/above threshold (add 5 more, total 10)
+	window.Add(5)
+	metaValid := window.GetWindowMetadata(threshold)
+	if metaValid.CompletedRequests != 10 {
+		t.Errorf("expected 10 completed requests, got %d", metaValid.CompletedRequests)
+	}
+	if !metaValid.IsValid {
+		t.Errorf("expected window to be valid at threshold")
+	}
+	if metaValid.FallbackRecommended {
+		t.Errorf("expected no fallback recommended when valid")
+	}
+	if metaValid.ReliabilityReason != "" {
+		t.Errorf("expected empty reliability reason when valid, got %s", metaValid.ReliabilityReason)
+	}
+}
+
+func TestLatencySeparationOverhead(t *testing.T) {
+	tracker := NewRequestTracker(10 * time.Second)
+
+	// Simulate LB request lifecycle:
+	// 1. LB receives request
+	req := tracker.StartRequest("GET", "/api/data")
+	time.Sleep(10 * time.Millisecond) // Simulated LB routing & scheduling overhead
+
+	// 2. LB forwards to backend
+	tracker.MarkProxyStart(req)
+	time.Sleep(20 * time.Millisecond) // Simulated upstream backend processing
+
+	// 3. LB receives response and finishes request
+	totalDur := tracker.EndRequest(req, 200, nil, 100, 200)
+
+	if totalDur < 25*time.Millisecond {
+		t.Errorf("expected total duration >= 25ms, got %v", totalDur)
+	}
+
+	backendStats := tracker.GetBackendLatencyStats()
+	overheadStats := tracker.GetOverheadLatencyStats()
+	totalStats := tracker.GetLatencyStats()
+
+	if backendStats.SampleCount != 1 || overheadStats.SampleCount != 1 || totalStats.SampleCount != 1 {
+		t.Fatalf("expected 1 sample in each histogram, got backend=%d overhead=%d total=%d",
+			backendStats.SampleCount, overheadStats.SampleCount, totalStats.SampleCount)
+	}
+
+	// Backend duration should be ~20ms (>= 15ms)
+	if backendStats.Avg < 15*time.Millisecond {
+		t.Errorf("expected backend duration >= 15ms, got %v", backendStats.Avg)
+	}
+
+	// Overhead duration should be ~10ms (>= 5ms)
+	if overheadStats.Avg < 5*time.Millisecond {
+		t.Errorf("expected overhead duration >= 5ms, got %v", overheadStats.Avg)
+	}
+
+	// Total duration must be >= backend duration + overhead duration
+	if totalStats.Avg < backendStats.Avg {
+		t.Errorf("total duration %v must be >= backend duration %v", totalStats.Avg, backendStats.Avg)
+	}
+}
+
+func TestMetricsSnapshotValidityAndFallback(t *testing.T) {
+	col := NewMetricsCollector(5 * time.Second)
+	col.SetMinSamplesThreshold(5)
+	col.RegisterBackend("b1", "http://localhost:8081", 1, 2, 1000, 50)
+
+	// Perform 3 requests (below threshold of 5)
+	for i := 0; i < 3; i++ {
+		req := col.RecordRequestStart("b1", "GET", "/test")
+		time.Sleep(2 * time.Millisecond)
+		col.MarkProxyStart(req)
+		time.Sleep(3 * time.Millisecond)
+		col.RecordRequestEnd("b1", req, 200, nil, 10, 20)
+	}
+
+	snap := col.CollectSnapshot()
+	if snap.IsValid {
+		t.Errorf("expected snapshot to be invalid with 3/5 requests")
+	}
+	if !snap.FallbackRecommended {
+		t.Errorf("expected fallback recommended with insufficient requests")
+	}
+	if snap.ReliabilityReason == "" {
+		t.Errorf("expected reliability reason to explain low samples")
+	}
+
+	// Perform 2 more requests (reach 5, equal to threshold)
+	for i := 0; i < 2; i++ {
+		req := col.RecordRequestStart("b1", "GET", "/test")
+		col.MarkProxyStart(req)
+		col.RecordRequestEnd("b1", req, 200, nil, 10, 20)
+	}
+
+	snapValid := col.CollectSnapshot()
+	if !snapValid.IsValid {
+		t.Errorf("expected snapshot to be valid with 5/5 requests, reason: %s", snapValid.ReliabilityReason)
+	}
+	if snapValid.FallbackRecommended {
+		t.Errorf("expected fallback NOT recommended when threshold met")
+	}
+
+	// Verify smoothed EMAs in snapshot
+	b1 := snapValid.Backends["b1"]
+	if b1 == nil {
+		t.Fatalf("expected backend b1 in snapshot")
+	}
+	if b1.RPS.Raw <= 0 {
+		t.Errorf("expected positive raw RPS, got %f", b1.RPS.Raw)
+	}
+	if b1.RPS.EMA01 <= 0 || b1.RPS.EMA03 <= 0 || b1.RPS.EMA05 <= 0 {
+		t.Errorf("expected positive smoothed EMAs for RPS: %+v", b1.RPS)
+	}
+
+	// Verify JSON marshaling includes Phase 2 fields
+	data, err := json.Marshal(snapValid)
+	if err != nil {
+		t.Fatalf("failed to marshal snapshot: %v", err)
+	}
+
+	var jsonMap map[string]any
+	if err := json.Unmarshal(data, &jsonMap); err != nil {
+		t.Fatalf("failed to unmarshal snapshot JSON: %v", err)
+	}
+
+	if _, ok := jsonMap["is_valid"]; !ok {
+		t.Errorf("missing 'is_valid' in snapshot JSON")
+	}
+	if _, ok := jsonMap["fallback_recommended"]; !ok {
+		t.Errorf("missing 'fallback_recommended' in snapshot JSON")
+	}
+	if _, ok := jsonMap["window"]; !ok {
+		t.Errorf("missing 'window' in snapshot JSON")
 	}
 }

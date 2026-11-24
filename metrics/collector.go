@@ -8,11 +8,12 @@ import (
 
 // MetricsCollector unifies all metric groups and produces consistent, validated snapshots.
 type MetricsCollector struct {
-	mu              sync.RWMutex
-	windowDuration  time.Duration
-	hostCollector   *HostMetricsCollector
-	probeTracker    *BackendProbeTracker
-	globalTracker   *RequestTracker
+	mu                  sync.RWMutex
+	windowDuration      time.Duration
+	minSamplesThreshold uint64
+	hostCollector       *HostMetricsCollector
+	probeTracker        *BackendProbeTracker
+	globalTracker       *RequestTracker
 
 	// Per-backend tracking
 	backendTrackers map[string]*RequestTracker
@@ -21,12 +22,12 @@ type MetricsCollector struct {
 	capacityConfigs map[string]*BackendCapacityConfig
 
 	// Controller tracking
-	controllerMu      sync.RWMutex
-	currentStrategy   string
-	lastSwitchAt      time.Time
-	lastDecisionTime  time.Duration
-	policyVersion     string
-	switchCount       uint64
+	controllerMu     sync.RWMutex
+	currentStrategy  string
+	lastSwitchAt     time.Time
+	lastDecisionTime time.Duration
+	policyVersion    string
+	switchCount      uint64
 }
 
 // NewMetricsCollector initializes a unified collector with the specified aggregation window.
@@ -37,17 +38,18 @@ func NewMetricsCollector(windowDuration time.Duration) *MetricsCollector {
 	now := time.Now()
 
 	return &MetricsCollector{
-		windowDuration:  windowDuration,
-		hostCollector:   NewHostMetricsCollector(),
-		probeTracker:    NewBackendProbeTracker(),
-		globalTracker:   NewRequestTracker(windowDuration),
-		backendTrackers: make(map[string]*RequestTracker),
-		backendHealth:   make(map[string]bool),
-		backendURLs:     make(map[string]string),
-		capacityConfigs: make(map[string]*BackendCapacityConfig),
-		currentStrategy: "Round-Robin",
-		lastSwitchAt:    now,
-		policyVersion:   "1.0.0-baseline",
+		windowDuration:      windowDuration,
+		minSamplesThreshold: 10,
+		hostCollector:       NewHostMetricsCollector(),
+		probeTracker:        NewBackendProbeTracker(),
+		globalTracker:       NewRequestTracker(windowDuration),
+		backendTrackers:     make(map[string]*RequestTracker),
+		backendHealth:       make(map[string]bool),
+		backendURLs:         make(map[string]string),
+		capacityConfigs:     make(map[string]*BackendCapacityConfig),
+		currentStrategy:     "Round-Robin",
+		lastSwitchAt:        now,
+		policyVersion:       "1.0.0-baseline",
 	}
 }
 
@@ -127,6 +129,23 @@ func (c *MetricsCollector) RecordRequestEnd(backendID string, req *ActiveRequest
 	return 0
 }
 
+// SetMinSamplesThreshold sets the minimum completed request count required for valid observation windows.
+func (c *MetricsCollector) SetMinSamplesThreshold(threshold uint64) {
+	atomic.StoreUint64(&c.minSamplesThreshold, threshold)
+}
+
+// GetMinSamplesThreshold returns the minimum sample count threshold for window validity.
+func (c *MetricsCollector) GetMinSamplesThreshold() uint64 {
+	return atomic.LoadUint64(&c.minSamplesThreshold)
+}
+
+// MarkProxyStart delegates proxy start timing to separate LB overhead from backend latency.
+func (c *MetricsCollector) MarkProxyStart(req *ActiveRequest) {
+	if req != nil {
+		req.ProxyStartTime = time.Now()
+	}
+}
+
 // RecordStrategySwitch tracks adaptive controller strategy modifications.
 func (c *MetricsCollector) RecordStrategySwitch(newStrategy string, decisionDuration time.Duration) {
 	c.controllerMu.Lock()
@@ -141,25 +160,38 @@ func (c *MetricsCollector) RecordStrategySwitch(newStrategy string, decisionDura
 // CollectSnapshot returns an immutable point-in-time snapshot of all metric groups.
 func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 	now := time.Now()
+	threshold := c.GetMinSamplesThreshold()
 
 	// 1. Host Resources
 	host := c.hostCollector.Sample()
 
 	// 2. Global Traffic
+	c.globalTracker.UpdateSmoothedValues()
 	inBytes, outBytes := c.globalTracker.GetBytes()
+	globalWindow := c.globalTracker.GetWindowMetadata(threshold)
+	globalDurationStats := c.globalTracker.GetLatencyStats()
+	globalBackendStats := c.globalTracker.GetBackendLatencyStats()
+	globalOverheadStats := c.globalTracker.GetOverheadLatencyStats()
+
 	globalTraffic := GlobalTrafficMetrics{
-		Timestamp:      now,
-		TotalRequests:  c.globalTracker.GetTotalRequests(),
-		TotalErrors:    c.globalTracker.GetTotalErrors(),
-		CurrentRPS:     c.globalTracker.GetRPS(),
-		ErrorRate:      c.globalTracker.GetErrorRate(),
-		ActiveRequests: c.globalTracker.GetActiveConnections(),
-		BytesReceived:  inBytes,
-		BytesSent:      outBytes,
-		DurationStats:  c.globalTracker.GetLatencyStats(),
-		MethodMix:      c.globalTracker.GetMethodMix(),
-		RouteMix:       c.globalTracker.GetRouteMix(),
-		WindowSeconds:  c.windowDuration.Seconds(),
+		Timestamp:             now,
+		TotalRequests:         c.globalTracker.GetTotalRequests(),
+		TotalErrors:           c.globalTracker.GetTotalErrors(),
+		CurrentRPS:            c.globalTracker.GetSmoothedRPS(),
+		ErrorRate:             c.globalTracker.GetSmoothedErrorRate(),
+		ActiveRequests:        c.globalTracker.GetActiveConnections(),
+		BytesReceived:         inBytes,
+		BytesSent:             outBytes,
+		DurationStats:         globalDurationStats,
+		BackendDurationStats:  globalBackendStats,
+		OverheadDurationStats: globalOverheadStats,
+		P50Latency:            c.globalTracker.GetSmoothedP50(),
+		P95Latency:            c.globalTracker.GetSmoothedP95(),
+		P99Latency:            c.globalTracker.GetSmoothedP99(),
+		Window:                globalWindow,
+		MethodMix:             c.globalTracker.GetMethodMix(),
+		RouteMix:              c.globalTracker.GetRouteMix(),
+		WindowSeconds:         c.windowDuration.Seconds(),
 	}
 
 	// 3. Per-Backend Runtime Metrics & Capacity
@@ -171,6 +203,12 @@ func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 		u := c.backendURLs[id]
 		healthy := c.backendHealth[id]
 
+		tracker.UpdateSmoothedValues()
+		bWindow := tracker.GetWindowMetadata(threshold)
+		bLatency := tracker.GetLatencyStats()
+		bBackendLatency := tracker.GetBackendLatencyStats()
+		bOverhead := tracker.GetOverheadLatencyStats()
+
 		backends[id] = &BackendRuntimeMetrics{
 			BackendID:        id,
 			URL:              u,
@@ -179,9 +217,15 @@ func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 			TotalRequests:    tracker.GetTotalRequests(),
 			TotalErrors:      tracker.GetTotalErrors(),
 			ErrorsByCategory: tracker.GetErrorBreakdown(),
-			RPS:              tracker.GetRPS(),
-			ErrorRate:        tracker.GetErrorRate(),
-			Latency:          tracker.GetLatencyStats(),
+			Window:           bWindow,
+			RPS:              tracker.GetSmoothedRPS(),
+			ErrorRate:        tracker.GetSmoothedErrorRate(),
+			Latency:          bLatency,
+			BackendLatency:   bBackendLatency,
+			Overhead:         bOverhead,
+			LatencyP50:       tracker.GetSmoothedP50(),
+			LatencyP95:       tracker.GetSmoothedP95(),
+			LatencyP99:       tracker.GetSmoothedP99(),
 			WindowSeconds:    c.windowDuration.Seconds(),
 			LastUpdated:      now,
 		}
@@ -209,12 +253,16 @@ func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 	c.controllerMu.RUnlock()
 
 	return &MetricsSnapshot{
-		Timestamp:       now,
-		WindowSeconds:   c.windowDuration.Seconds(),
-		Host:            host,
-		GlobalTraffic:   globalTraffic,
-		Backends:        backends,
-		CapacityConfigs: capacity,
-		Controller:      controller,
+		Timestamp:           now,
+		WindowSeconds:       c.windowDuration.Seconds(),
+		Window:              globalWindow,
+		IsValid:             globalWindow.IsValid,
+		FallbackRecommended: globalWindow.FallbackRecommended,
+		ReliabilityReason:   globalWindow.ReliabilityReason,
+		Host:                host,
+		GlobalTraffic:       globalTraffic,
+		Backends:            backends,
+		CapacityConfigs:     capacity,
+		Controller:          controller,
 	}
 }

@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -103,6 +104,41 @@ func (w *RollingWindow) Rate() float64 {
 		return 0.0
 	}
 	return float64(total) / elapsed
+}
+
+// GetWindowMetadata extracts window boundaries, total completed observations,
+// and evaluates statistical reliability against the specified sample threshold.
+func (w *RollingWindow) GetWindowMetadata(threshold uint64) WindowMetadata {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	now := time.Now()
+	start := now.Add(-w.windowDuration)
+	cutoff := start
+
+	var completed uint64
+	for _, b := range w.buckets {
+		if b.timestamp.After(cutoff) {
+			completed += b.count
+		}
+	}
+
+	isValid := completed >= threshold
+	var reason string
+	if !isValid {
+		reason = fmt.Sprintf("insufficient samples: %d completed requests (threshold: %d)", completed, threshold)
+	}
+
+	return WindowMetadata{
+		WindowStart:         start,
+		WindowEnd:           now,
+		WindowSeconds:       w.windowDuration.Seconds(),
+		CompletedRequests:   completed,
+		MinSamplesThreshold: threshold,
+		IsValid:             isValid,
+		FallbackRecommended: !isValid,
+		ReliabilityReason:   reason,
+	}
 }
 
 func (w *RollingWindow) rotate(now time.Time) {

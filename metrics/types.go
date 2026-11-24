@@ -100,6 +100,18 @@ func durationToMs(d time.Duration) float64 {
 	return float64(d.Microseconds()) / 1000.0
 }
 
+// WindowMetadata encapsulates observation window boundaries, request volume, and statistical reliability.
+type WindowMetadata struct {
+	WindowStart          time.Time `json:"window_start"`
+	WindowEnd            time.Time `json:"window_end"`
+	WindowSeconds        float64   `json:"window_seconds"`
+	CompletedRequests    uint64    `json:"completed_requests"`
+	MinSamplesThreshold  uint64    `json:"min_samples_threshold"`
+	IsValid              bool      `json:"is_valid"`
+	FallbackRecommended bool      `json:"fallback_recommended"`
+	ReliabilityReason    string    `json:"reliability_reason,omitempty"`
+}
+
 // BackendRuntimeMetrics represents observed load and service quality for an individual backend.
 type BackendRuntimeMetrics struct {
 	BackendID        string         `json:"backend_id"`
@@ -109,9 +121,15 @@ type BackendRuntimeMetrics struct {
 	TotalRequests    uint64         `json:"total_requests"` // monotonic counter
 	TotalErrors      uint64         `json:"total_errors"`   // monotonic counter
 	ErrorsByCategory ErrorBreakdown `json:"errors_by_category"`
-	RPS              float64        `json:"rps"`        // calculated over aggregation window
-	ErrorRate        float64        `json:"error_rate"` // errors/sec over aggregation window
-	Latency          LatencyStats   `json:"latency"`
+	Window           WindowMetadata `json:"window"`
+	RPS              SmoothedValue  `json:"rps"`             // raw window rate + EMAs (0.1, 0.3, 0.5)
+	ErrorRate        SmoothedValue  `json:"error_rate"`     // raw window rate + EMAs (0.1, 0.3, 0.5)
+	Latency          LatencyStats   `json:"latency"`        // end-to-end total latency
+	BackendLatency   LatencyStats   `json:"backend_latency"` // upstream service latency
+	Overhead         LatencyStats   `json:"overhead"`       // load-balancer routing/processing overhead
+	LatencyP50       SmoothedValue  `json:"latency_p50_ms"`
+	LatencyP95       SmoothedValue  `json:"latency_p95_ms"`
+	LatencyP99       SmoothedValue  `json:"latency_p99_ms"`
 	WindowSeconds    float64        `json:"window_seconds"`
 	LastUpdated      time.Time      `json:"last_updated"`
 }
@@ -132,18 +150,24 @@ type HostResourceMetrics struct {
 
 // GlobalTrafficMetrics describes overall incoming workload across all endpoints.
 type GlobalTrafficMetrics struct {
-	Timestamp      time.Time         `json:"timestamp"`
-	TotalRequests  uint64            `json:"total_requests"`
-	TotalErrors    uint64            `json:"total_errors"`
-	CurrentRPS     float64           `json:"current_rps"`
-	ErrorRate      float64           `json:"error_rate"`
-	ActiveRequests int64             `json:"active_requests"`
-	BytesReceived  uint64            `json:"bytes_received"`
-	BytesSent      uint64            `json:"bytes_sent"`
-	DurationStats  LatencyStats      `json:"duration_stats"`
-	MethodMix      map[string]uint64 `json:"method_mix"`
-	RouteMix       map[string]uint64 `json:"route_mix"`
-	WindowSeconds  float64           `json:"window_seconds"`
+	Timestamp             time.Time         `json:"timestamp"`
+	TotalRequests         uint64            `json:"total_requests"`
+	TotalErrors           uint64            `json:"total_errors"`
+	CurrentRPS            SmoothedValue     `json:"current_rps"`
+	ErrorRate             SmoothedValue     `json:"error_rate"`
+	ActiveRequests        int64             `json:"active_requests"`
+	BytesReceived         uint64            `json:"bytes_received"`
+	BytesSent             uint64            `json:"bytes_sent"`
+	DurationStats         LatencyStats      `json:"duration_stats"`
+	BackendDurationStats  LatencyStats      `json:"backend_duration_stats"`
+	OverheadDurationStats LatencyStats      `json:"overhead_duration_stats"`
+	P50Latency            SmoothedValue     `json:"p50_latency_ms"`
+	P95Latency            SmoothedValue     `json:"p95_latency_ms"`
+	P99Latency            SmoothedValue     `json:"p99_latency_ms"`
+	Window                WindowMetadata    `json:"window"`
+	MethodMix             map[string]uint64 `json:"method_mix"`
+	RouteMix              map[string]uint64 `json:"route_mix"`
+	WindowSeconds         float64           `json:"window_seconds"`
 }
 
 // BackendCapacityConfig describes capacity limits and static hardware sizing for heterogeneous backends.
@@ -170,11 +194,15 @@ type ControllerMetrics struct {
 
 // MetricsSnapshot provides an atomic, consistent point-in-time view of all metric groups.
 type MetricsSnapshot struct {
-	Timestamp       time.Time                          `json:"timestamp"`
-	WindowSeconds   float64                            `json:"window_seconds"`
-	Host            HostResourceMetrics                `json:"host"`
-	GlobalTraffic   GlobalTrafficMetrics               `json:"global_traffic"`
-	Backends        map[string]*BackendRuntimeMetrics  `json:"backends"`
-	CapacityConfigs map[string]*BackendCapacityConfig  `json:"capacity_configs"`
-	Controller      ControllerMetrics                  `json:"controller"`
+	Timestamp           time.Time                         `json:"timestamp"`
+	WindowSeconds       float64                           `json:"window_seconds"`
+	Window              WindowMetadata                    `json:"window"`
+	IsValid             bool                              `json:"is_valid"`
+	FallbackRecommended bool                              `json:"fallback_recommended"`
+	ReliabilityReason   string                            `json:"reliability_reason,omitempty"`
+	Host                HostResourceMetrics               `json:"host"`
+	GlobalTraffic       GlobalTrafficMetrics              `json:"global_traffic"`
+	Backends            map[string]*BackendRuntimeMetrics `json:"backends"`
+	CapacityConfigs     map[string]*BackendCapacityConfig `json:"capacity_configs"`
+	Controller          ControllerMetrics                 `json:"controller"`
 }

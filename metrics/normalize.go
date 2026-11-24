@@ -68,8 +68,8 @@ func BackendFeatureVector(b *BackendRuntimeMetrics, cap *BackendCapacityConfig) 
 	}
 
 	vec[1] = MinMaxNormalize(float64(b.ActiveConns), 0, 100)
-	vec[2] = MinMaxNormalize(b.RPS, 0, 1000)
-	vec[3] = MinMaxNormalize(b.ErrorRate, 0, 100)
+	vec[2] = MinMaxNormalize(b.RPS.Raw, 0, 1000)
+	vec[3] = MinMaxNormalize(b.ErrorRate.Raw, 0, 100)
 	vec[4] = MinMaxNormalize(b.Latency.P95Ms, 0, 500)
 
 	weight := 1

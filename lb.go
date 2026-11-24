@@ -181,6 +181,9 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 			})
 		}()
 
+		if col != nil {
+			col.MarkProxyStart(activeReq)
+		}
 		peer.ReverseProxy.ServeHTTP(capturedWriter, r)
 	}
 }
@@ -331,9 +334,27 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 			Timestamp:   time.Now().UnixMilli(),
 		})
 
+		// If custom delay requested, forward to backend with X-Simulated-Delay
+		targetURL := peer.URL.String()
+		if body.Delay != "" {
+			targetURL += "/?delay=" + body.Delay
+		}
+
+		col := pool.GetCollector()
+		var activeReq *metrics.ActiveRequest
+		if col != nil {
+			activeReq = col.RecordRequestStart(peer.Name, http.MethodGet, targetURL)
+		}
+
 		start := time.Now()
+		respStatusCode := http.StatusOK
+		var respErr error
+
 		defer func() {
 			conns := peer.DecConns()
+			if col != nil {
+				col.RecordRequestEnd(peer.Name, activeReq, respStatusCode, respErr, 0, 0)
+			}
 			eventBus.Publish(RequestEvent{
 				ID:          reqID,
 				Type:        "complete",
@@ -343,25 +364,30 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 				Strategy:    stratName,
 				ActiveConns: conns,
 				DurationMs:  time.Since(start).Milliseconds(),
-				Status:      http.StatusOK,
+				Status:      respStatusCode,
 				Timestamp:   time.Now().UnixMilli(),
 			})
 		}()
 
-		// If custom delay requested, forward to backend with X-Simulated-Delay
-		targetURL := peer.URL.String()
-		if body.Delay != "" {
-			targetURL += "/?delay=" + body.Delay
-		}
 		req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURL, nil)
 		if err == nil {
 			if body.Delay != "" {
 				req.Header.Set("X-Simulated-Delay", body.Delay)
 			}
-			resp, err := http.DefaultClient.Do(req)
-			if err == nil {
+			if col != nil {
+				col.MarkProxyStart(activeReq)
+			}
+			resp, doErr := http.DefaultClient.Do(req)
+			if doErr != nil {
+				respErr = doErr
+				respStatusCode = http.StatusBadGateway
+			} else {
+				respStatusCode = resp.StatusCode
 				_ = resp.Body.Close()
 			}
+		} else {
+			respErr = err
+			respStatusCode = http.StatusBadRequest
 		}
 
 		duration := time.Since(start).Milliseconds()

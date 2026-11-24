@@ -212,3 +212,50 @@ vector := metrics.BackendFeatureVector(backendMetrics, capacityConfig)
 * `[3]` Error rate normalized (`0 to 100 err/s max`)
 * `[4]` Latency p95 in milliseconds normalized (`0 to 500ms max`)
 * `[5]` Static capacity weight normalized (`1 to 10 max`)
+
+---
+
+## 6. Phase 2: Request Instrumentation, Overhead Separation & Rolling Windows
+
+### 6.1 Request Lifecycle & Non-Blocking Instrumentation
+The request hot path follows a cheap, non-blocking lifecycle:
+1. **Request Enters LB**: Active in-flight connections incremented atomically, request start timestamp recorded (`req.StartTime`).
+2. **Backend Selection**: Strategy selects peer node (`GetNextPeerWithKey`).
+3. **Proxy Forwarding**: Immediately prior to dispatching `ReverseProxy.ServeHTTP()`, proxy start timestamp is recorded (`col.MarkProxyStart(activeReq)`).
+4. **Deferred Completion**: A deferred closure executes regardless of success, 5xx status, transport error, or client cancellation:
+   - Decrements active connections atomically.
+   - Computes upstream backend duration: `backendDuration = time.Since(req.ProxyStartTime)`.
+   - Computes load balancer overhead: `overheadDuration = totalDuration - backendDuration`.
+   - Updates histograms: total duration, backend duration, overhead duration.
+   - Increments completed requests window counter.
+   - Categorizes failures and updates error windows.
+
+### 6.2 Latency Overhead Separation
+By capturing `StartTime` at LB entrance and `ProxyStartTime` immediately before writing the request to upstream TCP sockets, the controller isolates internal scheduling/routing overhead from upstream service latency:
+$$\text{Total Latency} = \text{LB Overhead} + \text{Upstream Backend Latency}$$
+Each snapshot exposes distributions for all three: `latency`, `backend_latency`, and `overhead`.
+
+### 6.3 Observation Windows & Statistical Reliability
+Snapshots are evaluated over a rolling 10-second window divided into 10 1-second buckets (`RollingWindow`):
+* `window_start` & `window_end`: Exact time boundaries of the sliding observation period.
+* `completed_requests`: Count of finished requests within the window.
+* `min_samples_threshold`: Minimum completed requests (default: 10) required to evaluate latency percentiles reliably.
+* `is_valid`: Boolean flag set to `true` when `completed_requests >= min_samples_threshold`.
+* `fallback_recommended`: Recommended conservative fallback or policy retention when sample size is too low to prevent volatile controller switching.
+* `reliability_reason`: Diagnostic description of invalid window states (e.g. `"insufficient samples: 3 completed requests (threshold: 10)"`).
+
+### 6.4 Multi-Coefficient Exponential Moving Averages (EMA)
+To smooth noisy continuous signals (RPS, error rate, p50/p95/p99 latency) without discarding the underlying distribution:
+$$\text{EMA}_t = \alpha \cdot x_t + (1 - \alpha) \cdot \text{EMA}_{t-1}$$
+Every continuous metric provides `SmoothedValue` containing both raw window observations and smoothed values across multiple coefficients ($\alpha \in \{0.1, 0.3, 0.5\}$):
+```json
+{
+  "raw": 154.2,
+  "ema_01": 132.8,
+  "ema_03": 148.5,
+  "ema_05": 152.1
+}
+```
+* **$\alpha = 0.1$**: Slow, high-smoothing filter resilient to transient spikes.
+* **$\alpha = 0.3$**: Balanced baseline for trend detection.
+* **$\alpha = 0.5$**: Fast, responsive filter tracking workload shifts quickly.
