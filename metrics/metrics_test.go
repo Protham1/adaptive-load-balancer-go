@@ -260,16 +260,17 @@ func TestNormalizeUtilities(t *testing.T) {
 	// Vectorize
 	b := &BackendRuntimeMetrics{
 		Healthy:     true,
+		Eligible:    true,
 		ActiveConns: 50,
 		RPS:         SmoothedValue{Raw: 500},
 		ErrorRate:   SmoothedValue{Raw: 10},
 		Latency:     LatencyStats{P95Ms: 250},
 	}
-	cap := &BackendCapacityConfig{StaticWeight: 5}
+	cap := &BackendCapacityConfig{StaticWeight: 5, ConnectionLimit: 100}
 
 	vec := BackendFeatureVector(b, cap)
-	if len(vec) != 6 {
-		t.Fatalf("expected 6-feature vector, got %d", len(vec))
+	if len(vec) != 8 {
+		t.Fatalf("expected 8-feature vector, got %d", len(vec))
 	}
 	if vec[0] != 1.0 || vec[1] != 0.5 {
 		t.Errorf("unexpected vector values: %v", vec)
@@ -575,5 +576,166 @@ func TestMetricsSnapshotValidityAndFallback(t *testing.T) {
 	}
 	if _, ok := jsonMap["window"]; !ok {
 		t.Errorf("missing 'window' in snapshot JSON")
+	}
+	if _, ok := jsonMap["global_traffic"].(map[string]any)["workload"]; !ok {
+		t.Errorf("missing 'workload' in global_traffic JSON")
+	}
+}
+
+func TestBoundedMethodAndRouteCanonicalization(t *testing.T) {
+	// Methods
+	if CanonicalizeMethod("get") != "GET" {
+		t.Errorf("expected GET, got %s", CanonicalizeMethod("get"))
+	}
+	if CanonicalizeMethod("POST") != "POST" {
+		t.Errorf("expected POST, got %s", CanonicalizeMethod("POST"))
+	}
+	if CanonicalizeMethod("CUSTOM_RPC") != "OTHER" {
+		t.Errorf("expected OTHER for CUSTOM_RPC, got %s", CanonicalizeMethod("CUSTOM_RPC"))
+	}
+	if CanonicalizeMethod("invalid/malicious") != "OTHER" {
+		t.Errorf("expected OTHER for invalid method, got %s", CanonicalizeMethod("invalid/malicious"))
+	}
+
+	// Routes
+	if CanonicalizeRoute("/") != "/" {
+		t.Errorf("expected /, got %s", CanonicalizeRoute("/"))
+	}
+	if CanonicalizeRoute("/api/send-request?delay=50") != "/api/send-request" {
+		t.Errorf("expected /api/send-request, got %s", CanonicalizeRoute("/api/send-request?delay=50"))
+	}
+	if CanonicalizeRoute("/bench-12345") != "/bench" {
+		t.Errorf("expected /bench, got %s", CanonicalizeRoute("/bench-12345"))
+	}
+	if CanonicalizeRoute("/random/user/account/999") != "OTHER" {
+		t.Errorf("expected OTHER for arbitrary path, got %s", CanonicalizeRoute("/random/user/account/999"))
+	}
+}
+
+func TestLongRequestFractionAndWorkloadClasses(t *testing.T) {
+	tracker := NewRequestTracker(10 * time.Second)
+	// Set threshold to 50ms for test
+	tracker.SetLongRequestThreshold(50 * time.Millisecond)
+
+	// 1. Short request (< 50ms)
+	req1 := tracker.StartRequest("GET", "/api/data")
+	tracker.EndRequest(req1, 200, nil, 64, 128)
+
+	// 2. Long request (>= 50ms)
+	req2 := tracker.StartRequest("GET", "/api/heavy")
+	time.Sleep(55 * time.Millisecond)
+	tracker.EndRequest(req2, 200, nil, 100, 200)
+
+	// 3. Compute-heavy request
+	req3 := tracker.StartRequest("POST", "/api/compute", true)
+	tracker.EndRequest(req3, 200, nil, 256, 512, true)
+
+	features := tracker.GetWorkloadFeatures()
+
+	if features.LongRequestThresholdMs != 50.0 {
+		t.Errorf("expected threshold 50ms, got %f", features.LongRequestThresholdMs)
+	}
+	if features.LongRequestCount != 1 {
+		t.Errorf("expected 1 long request, got %d", features.LongRequestCount)
+	}
+	// 3 requests completed, 1 long request => 1/3 ~ 0.333
+	if features.LongRequestFraction < 0.30 || features.LongRequestFraction > 0.35 {
+		t.Errorf("expected ~0.33 long request fraction, got %f", features.LongRequestFraction)
+	}
+
+	// Workload classes
+	if features.WorkloadClassCounts["compute-heavy"] != 1 {
+		t.Errorf("expected 1 compute-heavy request, got %d", features.WorkloadClassCounts["compute-heavy"])
+	}
+	if features.WorkloadClassCounts["long-running"] != 1 {
+		t.Errorf("expected 1 long-running request, got %d", features.WorkloadClassCounts["long-running"])
+	}
+}
+
+func TestPayloadSizeSummaries(t *testing.T) {
+	tracker := NewRequestTracker(10 * time.Second)
+
+	req1 := tracker.StartRequest("POST", "/upload")
+	tracker.EndRequest(req1, 200, nil, 1000, 500)
+
+	req2 := tracker.StartRequest("POST", "/upload")
+	tracker.EndRequest(req2, 200, nil, 2000, 1500)
+
+	features := tracker.GetWorkloadFeatures()
+	sizes := features.PayloadSizes
+
+	if sizes.TotalBytesIn != 3000 {
+		t.Errorf("expected 3000 total bytes in, got %d", sizes.TotalBytesIn)
+	}
+	if sizes.TotalBytesOut != 2000 {
+		t.Errorf("expected 2000 total bytes out, got %d", sizes.TotalBytesOut)
+	}
+	if sizes.AvgRequestSizeBytes != 1500.0 {
+		t.Errorf("expected avg req size 1500, got %f", sizes.AvgRequestSizeBytes)
+	}
+	if sizes.AvgResponseSizeBytes != 1000.0 {
+		t.Errorf("expected avg resp size 1000, got %f", sizes.AvgResponseSizeBytes)
+	}
+	if sizes.MaxRequestSizeBytes != 2000 {
+		t.Errorf("expected max req size 2000, got %d", sizes.MaxRequestSizeBytes)
+	}
+	if sizes.MaxResponseSizeBytes != 1500 {
+		t.Errorf("expected max resp size 1500, got %d", sizes.MaxResponseSizeBytes)
+	}
+}
+
+func TestBackendCapacityFeaturesAndValidation(t *testing.T) {
+	col := NewMetricsCollector(5 * time.Second)
+	// Backend with connection limit of 2, benchmark RPS of 1000
+	col.RegisterBackendWithCapacity("b1", "http://localhost:8081", 3, 4, 1024*1024, 2, "medium", 1000.0, 2.0)
+
+	// Active conns = 0 -> Eligible
+	snap1 := col.CollectSnapshot()
+	b1 := snap1.Backends["b1"]
+	if b1 == nil || !b1.Eligible {
+		t.Fatalf("expected b1 to be eligible initially")
+	}
+	if b1.Capacity.DeclaredCapacityClass != "medium" {
+		t.Errorf("expected class medium, got %s", b1.Capacity.DeclaredCapacityClass)
+	}
+
+	// Start 2 requests (reach connection limit of 2)
+	req1 := col.RecordRequestStart("b1", "GET", "/test")
+	req2 := col.RecordRequestStart("b1", "GET", "/test")
+
+	snap2 := col.CollectSnapshot()
+	b1Limit := snap2.Backends["b1"]
+	if b1Limit.Eligible {
+		t.Errorf("expected b1 to be ineligible when connection limit is reached")
+	}
+
+	// Complete requests
+	col.RecordRequestEnd("b1", req1, 200, nil, 10, 20)
+	col.RecordRequestEnd("b1", req2, 200, nil, 10, 20)
+
+	snap3 := col.CollectSnapshot()
+	b1Recovered := snap3.Backends["b1"]
+	if !b1Recovered.Eligible {
+		t.Errorf("expected b1 to become eligible again after connections freed")
+	}
+}
+
+func TestWorkloadFeatureVector(t *testing.T) {
+	col := NewMetricsCollector(5 * time.Second)
+	col.RegisterBackend("b1", "http://localhost:8081", 1, 2, 1000, 50)
+
+	req := col.RecordRequestStart("b1", "GET", "/api/send-request")
+	col.RecordRequestEnd("b1", req, 200, nil, 128, 256)
+
+	snap := col.CollectSnapshot()
+	vec := WorkloadFeatureVector(&snap.GlobalTraffic)
+
+	if len(vec) != 9 {
+		t.Fatalf("expected 9-element workload feature vector, got %d", len(vec))
+	}
+	for i, v := range vec {
+		if v < 0.0 || v > 1.0 {
+			t.Errorf("feature[%d] = %f outside [0.0, 1.0] range", i, v)
+		}
 	}
 }

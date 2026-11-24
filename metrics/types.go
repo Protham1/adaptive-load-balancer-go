@@ -114,24 +114,26 @@ type WindowMetadata struct {
 
 // BackendRuntimeMetrics represents observed load and service quality for an individual backend.
 type BackendRuntimeMetrics struct {
-	BackendID        string         `json:"backend_id"`
-	URL              string         `json:"url"`
-	Healthy          bool           `json:"healthy"`
-	ActiveConns      int64          `json:"active_connections"`
-	TotalRequests    uint64         `json:"total_requests"` // monotonic counter
-	TotalErrors      uint64         `json:"total_errors"`   // monotonic counter
-	ErrorsByCategory ErrorBreakdown `json:"errors_by_category"`
-	Window           WindowMetadata `json:"window"`
-	RPS              SmoothedValue  `json:"rps"`             // raw window rate + EMAs (0.1, 0.3, 0.5)
-	ErrorRate        SmoothedValue  `json:"error_rate"`     // raw window rate + EMAs (0.1, 0.3, 0.5)
-	Latency          LatencyStats   `json:"latency"`        // end-to-end total latency
-	BackendLatency   LatencyStats   `json:"backend_latency"` // upstream service latency
-	Overhead         LatencyStats   `json:"overhead"`       // load-balancer routing/processing overhead
-	LatencyP50       SmoothedValue  `json:"latency_p50_ms"`
-	LatencyP95       SmoothedValue  `json:"latency_p95_ms"`
-	LatencyP99       SmoothedValue  `json:"latency_p99_ms"`
-	WindowSeconds    float64        `json:"window_seconds"`
-	LastUpdated      time.Time      `json:"last_updated"`
+	BackendID        string                 `json:"backend_id"`
+	URL              string                 `json:"url"`
+	Healthy          bool                   `json:"healthy"`
+	Eligible         bool                   `json:"eligible"`
+	ActiveConns      int64                  `json:"active_connections"`
+	TotalRequests    uint64                 `json:"total_requests"` // monotonic counter
+	TotalErrors      uint64                 `json:"total_errors"`   // monotonic counter
+	ErrorsByCategory ErrorBreakdown         `json:"errors_by_category"`
+	Window           WindowMetadata         `json:"window"`
+	RPS              SmoothedValue          `json:"rps"`             // raw window rate + EMAs (0.1, 0.3, 0.5)
+	ErrorRate        SmoothedValue          `json:"error_rate"`     // raw window rate + EMAs (0.1, 0.3, 0.5)
+	Latency          LatencyStats           `json:"latency"`        // end-to-end total latency
+	BackendLatency   LatencyStats           `json:"backend_latency"` // upstream service latency
+	Overhead         LatencyStats           `json:"overhead"`       // load-balancer routing/processing overhead
+	LatencyP50       SmoothedValue          `json:"latency_p50_ms"`
+	LatencyP95       SmoothedValue          `json:"latency_p95_ms"`
+	LatencyP99       SmoothedValue          `json:"latency_p99_ms"`
+	Capacity         *BackendCapacityConfig `json:"capacity,omitempty"`
+	WindowSeconds    float64                `json:"window_seconds"`
+	LastUpdated      time.Time              `json:"last_updated"`
 }
 
 // HostResourceMetrics represents system and process resource pressure.
@@ -146,6 +148,28 @@ type HostResourceMetrics struct {
 	GCPauseTotalNs   uint64        `json:"gc_pause_total_ns"`
 	Source           string        `json:"source"` // "process" or "host"
 	LimitationNote   string        `json:"limitation_note"`
+}
+
+// PayloadSizeStats summarizes request and response sizes affecting backend computational cost.
+type PayloadSizeStats struct {
+	TotalBytesIn         uint64  `json:"total_bytes_in"`
+	TotalBytesOut        uint64  `json:"total_bytes_out"`
+	AvgRequestSizeBytes  float64 `json:"avg_request_size_bytes"`
+	AvgResponseSizeBytes float64 `json:"avg_response_size_bytes"`
+	MaxRequestSizeBytes  uint64  `json:"max_request_size_bytes"`
+	MaxResponseSizeBytes uint64  `json:"max_response_size_bytes"`
+}
+
+// WorkloadFeatures captures dynamic traffic characteristics across bounded categories and duration profiles.
+type WorkloadFeatures struct {
+	RPSTrend               string             `json:"rps_trend"` // "rising", "falling", "stable"
+	RPSDerivative          float64            `json:"rps_derivative"`
+	LongRequestThresholdMs float64            `json:"long_request_threshold_ms"`
+	LongRequestCount       uint64             `json:"long_request_count"`
+	LongRequestFraction    float64            `json:"long_request_fraction"`
+	PayloadSizes           PayloadSizeStats   `json:"payload_sizes"`
+	WorkloadClassCounts    map[string]uint64  `json:"workload_class_counts"`
+	WorkloadClassFractions map[string]float64 `json:"workload_class_fractions"`
 }
 
 // GlobalTrafficMetrics describes overall incoming workload across all endpoints.
@@ -167,17 +191,24 @@ type GlobalTrafficMetrics struct {
 	Window                WindowMetadata    `json:"window"`
 	MethodMix             map[string]uint64 `json:"method_mix"`
 	RouteMix              map[string]uint64 `json:"route_mix"`
+	Workload              WorkloadFeatures  `json:"workload"`
 	WindowSeconds         float64           `json:"window_seconds"`
 }
 
-// BackendCapacityConfig describes capacity limits and static hardware sizing for heterogeneous backends.
+// BackendCapacityConfig describes capacity limits, declared hardware sizing, and empirical benchmark validation.
 type BackendCapacityConfig struct {
-	BackendID        string `json:"backend_id"`
-	URL              string `json:"url"`
-	StaticWeight     int    `json:"static_weight"`
-	CPUCores         int    `json:"cpu_cores"`
-	MemoryLimitBytes uint64 `json:"memory_limit_bytes"`
-	ConnectionLimit  int64  `json:"connection_limit"`
+	BackendID                string  `json:"backend_id"`
+	URL                      string  `json:"url"`
+	StaticWeight             int     `json:"static_weight"`
+	DeclaredCapacityClass    string  `json:"declared_capacity_class"` // e.g. "small", "medium", "large"
+	CPUCores                 int     `json:"cpu_cores"`
+	MemoryLimitBytes         uint64  `json:"memory_limit_bytes"`
+	ConnectionLimit          int64   `json:"connection_limit"`
+	IsEligible               bool    `json:"is_eligible"`
+	BenchmarkRPS             float64 `json:"benchmark_rps"`               // empirically measured capacity
+	BenchmarkP95Ms           float64 `json:"benchmark_p95_ms"`            // empirically measured latency
+	ObservedVsBenchmarkRatio float64 `json:"observed_vs_benchmark_ratio"` // runtime RPS / benchmark RPS
+	HardwareVsEmpiricalScore float64 `json:"hardware_vs_empirical_score"` // validation factor (1.0 = hardware matches benchmarks)
 }
 
 // ControllerMetrics measures adaptive load balancer controller behavior, decisions, and overhead.

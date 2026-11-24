@@ -201,7 +201,89 @@ flowchart TD
 
 ---
 
-## 5. Architectural Summary & Best Practices
+## 5. Phase 3 — Backend Capacity and Workload Features
+
+### 5.1 Objectives
+1. Record static capacity features per backend: configured capacity, CPU cores, declared capacity class (`small`, `medium`, `large`), memory limits, connection limits, and eligibility/health.
+2. Validate hardware specifications against empirical benchmarks rather than assuming static specs predict runtime throughput.
+3. Track comprehensive workload features:
+   - Global RPS and its recent trend/derivative.
+   - Average and percentile duration distributions.
+   - Bounded request method and endpoint/route labels to prevent cardinality explosion.
+   - Long-request fraction defined by a documented duration threshold.
+   - Payload size summaries (average/max bytes in and out).
+   - Workload classes (`short`, `long-running`, `compute-heavy`) labeled reliably.
+4. Enforce strict safety and privacy guarantees: no request bodies, query strings, or sensitive client data sent to models; client IP used strictly for consistent-hashing and never as a general identity feature.
+
+### 5.2 Methods & Implementation Details
+
+#### 1. Backend Capacity Features & Empirical Validation
+* **Data Model (`BackendCapacityConfig`)**:
+  * `declared_capacity_class`: Categorized sizing (`small`, `medium`, `large`).
+  * `cpu_cores`: Declared or provisioned core limits.
+  * `memory_limit_bytes`: Provisioned memory ceiling (0 if unknown).
+  * `connection_limit`: Maximum enforced concurrent connections.
+  * `is_eligible`: Dynamic eligibility evaluated on every snapshot:
+    $$\text{Eligible} = \text{Healthy} \land (\text{connection\_limit} \le 0 \lor \text{active\_conns} < \text{connection\_limit})$$
+  * `benchmark_rps` & `benchmark_p95_ms`: Empirically validated capacity baseline from benchmark runs.
+  * `observed_vs_benchmark_ratio`: Runtime comparison factor:
+    $$\text{ObservedVsBenchmarkRatio} = \frac{\text{Runtime RPS}}{\text{Benchmark RPS}}$$
+  * `hardware_vs_empirical_score`: Validates whether hardware weight matches empirical throughput:
+    $$\text{Score} = \frac{\text{Actual RPS per Weight}}{\text{Expected RPS per Weight}}$$
+
+#### 2. Workload Features & Bounded Tracking
+* **Bounded Labeling**:
+  * *Methods*: Bounded whitelist (`GET`, `POST`, `PUT`, `DELETE`, `HEAD`, `OPTIONS`, `PATCH`). All arbitrary or non-standard verbs mapped to `"OTHER"`.
+  * *Routes*: Bounded endpoint prefix mapping (`/`, `/api/send-request`, `/api/status`, `/api/strategy`, `/api/metrics`, `/api/events`, `/api/backends`, `/bench`, `/health`). All arbitrary dynamic URLs collapsed to `"OTHER"`.
+* **Long-Request Fraction**:
+  * Configurable threshold (default: $100\text{ms}$).
+  * Computed over the active rolling window:
+    $$\text{LongRequestFraction} = \frac{\text{completed requests with duration} \ge \text{threshold}}{\text{total completed requests in window}}$$
+* **Workload Classes**:
+  * `"short"`: Duration $< 50\text{ms}$.
+  * `"long-running"`: Duration $\ge 100\text{ms}$.
+  * `"compute-heavy"`: Requests tagged with simulated delays or compute endpoints.
+  * Both counts and relative fractions in the active window are exposed.
+* **Payload Size Summaries**:
+  * Tracks `total_bytes_in`, `total_bytes_out`, `avg_request_size_bytes`, `avg_response_size_bytes`, `max_request_size_bytes`, and `max_response_size_bytes`.
+* **RPS Trend & Derivative**:
+  * Evaluates instantaneous rate against smoothed EMA:
+    $$\text{Derivative} = \frac{\text{CurrentRPS.Raw} - \text{CurrentRPS.EMA01}}{\text{CurrentRPS.EMA01}}$$
+  * Categorizes trend into `"rising"` ($> +15\%$), `"falling"` ($< -15\%$), or `"stable"$.
+
+#### 3. Normalization & Machine Learning Vectors (`metrics/normalize.go`)
+* **`BackendFeatureVector` (8-dimensional state vector)**:
+  1. `[0]` Eligibility & Health (`1.0` if eligible and healthy, `0.5` if healthy but saturated, `0.0` if down).
+  2. `[1]` Active connection utilization normalized to connection limit.
+  3. `[2]` Normalized RPS ($0$ to $1000\text{ req/s}$).
+  4. `[3]` Normalized Error rate ($0$ to $100\text{ err/s}$).
+  5. `[4]` Normalized Latency P95 ($0$ to $500\text{ms}$).
+  6. `[5]` Normalized Static capacity weight ($1$ to $10$).
+  7. `[6]` Observed vs Benchmark ratio ($0.0$ to $2.0$).
+  8. `[7]` CPU cores normalized ($1$ to $16$).
+* **`WorkloadFeatureVector` (9-dimensional state vector)**:
+  1. `[0]` Current RPS normalized ($0$ to $2000\text{ req/s}$).
+  2. `[1]` RPS Trend / Derivative normalized ($-1.0$ to $1.0$).
+  3. `[2]` Average duration normalized ($0$ to $200\text{ms}$).
+  4. `[3]` P95 duration normalized ($0$ to $500\text{ms}$).
+  5. `[4]` Long-request fraction $[0.0, 1.0]$.
+  6. `[5]` Short-request fraction $[0.0, 1.0]$.
+  7. `[6]` Compute-heavy workload fraction $[0.0, 1.0]$.
+  8. `[7]` Average request payload size ($0$ to $64\text{KB}$).
+  9. `[8]` Average response payload size ($0$ to $64\text{KB}$).
+
+#### 4. Safety & Privacy Guarantees
+* No request bodies or headers containing potential credentials are saved or forwarded to the telemetry or ML layers.
+* Client IP is exclusively utilized in `ServerPool.GetNextPeerWithKey(clientIP)` as a hash ring lookup key; it is never serialized in metrics snapshots or feature vectors.
+
+### 5.3 Important Conclusions
+1. Bounded method and route canonicalization effectively eliminates memory leaks caused by unbounded URL cardinality.
+2. Saturated backends reaching their connection ceiling are automatically flagged as ineligible (`Eligible = false`), preventing controller queue pile-up before circuit breakers trigger.
+3. Combining static hardware ratings with runtime benchmark ratios provides a reliable ground truth for adaptive routing.
+
+---
+
+## 6. Architectural Summary & Best Practices
 
 ```mermaid
 flowchart LR
@@ -210,11 +292,12 @@ flowchart LR
     Tracker --> Hist["Latency Histograms (Total / Backend / Overhead)"]
     Tracker --> EMA["MultiEMA (0.1, 0.3, 0.5)"]
     Tracker --> Win["Rolling Window (10s / 1s buckets)"]
+    Tracker --> Workload["Workload Features (Sizes / Mix / Trend / Classes)"]
     
     subgraph Upstream["Upstream Pool"]
-        B1["Backend 1 (Weight 3)"]
-        B2["Backend 2 (Weight 2)"]
-        B3["Backend 3 (Weight 1)"]
+        B1["Backend 1 (Weight 3, 4 Cores)"]
+        B2["Backend 2 (Weight 2, 2 Cores)"]
+        B3["Backend 3 (Weight 1, 1 Core)"]
     end
     
     LB --> Upstream
@@ -222,7 +305,7 @@ flowchart LR
     subgraph Telemetry["Unified Telemetry"]
         Collector["MetricsCollector"]
         API["GET /api/metrics"]
-        Vector["ML Feature Vector (normalize.go)"]
+        Vector["ML Vectors: Backend (8D) + Workload (9D)"]
     end
     
     Tracker --> Collector
@@ -234,15 +317,16 @@ flowchart LR
 1. **Lock-Free Hot Path**: Request dispatching and metric recording rely on atomic operations; locks are strictly confined to bucket rotation and window snapshots.
 2. **Deterministic Lifecycle**: Every request increments exactly once on entrance and decrements exactly once in a deferred block covering normal responses, 5xx statuses, network failures, and client aborts.
 3. **Serialization Boundaries**: Time durations remain strict `time.Duration` throughout the core engine and are converted to milliseconds solely during JSON encoding.
-4. **Backward Compatibility**: Fully compatible with existing REST endpoints (`/api/status`, `/api/strategy`, `/api/send-request`, `/api/events`).
+4. **Cardinated Bounded Guarantees**: Method and route dimensions are strictly bounded to prevent heap exhaustion.
+5. **Zero Data Leakage**: Sensitive payload contents and client identities are excluded from telemetry pipelines.
 
 ---
 
-## 6. Next Steps & Road Ahead
+## 7. Next Steps & Road Ahead
 
-* **Phase 3 — Adaptive Controller & Policy Engine**:
-  * Implement heuristic and machine-learning controllers evaluating `SmoothedValue` and `BackendFeatureVector`.
+* **Phase 4 — Adaptive Controller & Policy Engine**:
+  * Implement heuristic and machine-learning controllers consuming `BackendFeatureVector` and `WorkloadFeatureVector`.
   * Trigger dynamic strategy switching based on real-time load, backend latency divergence, and error bursts.
-  * Honor `FallbackRecommended` to keep strategies stable during low-traffic windows.
-* **Phase 4 — Controlled Fault Injection & Evaluation**:
+  * Honor `FallbackRecommended` and `Eligible` flags to keep strategies stable during low-traffic windows.
+* **Phase 5 — Controlled Fault Injection & Stress Evaluation**:
   * Evaluate adaptive controller behavior against static baselines under traffic surges, backend degradation, and network partitions.

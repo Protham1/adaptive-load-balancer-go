@@ -3,16 +3,69 @@ package metrics
 import (
 	"context"
 	"errors"
+	"math"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 )
 
+// StandardMethods defines the bounded set of canonical HTTP methods to prevent cardinality explosion.
+var StandardMethods = map[string]bool{
+	"GET":     true,
+	"POST":    true,
+	"PUT":     true,
+	"DELETE":  true,
+	"HEAD":    true,
+	"OPTIONS": true,
+	"PATCH":   true,
+}
+
+// CanonicalizeMethod returns a bounded method string, mapping unrecognized methods to "OTHER".
+func CanonicalizeMethod(method string) string {
+	upper := strings.ToUpper(strings.TrimSpace(method))
+	if StandardMethods[upper] {
+		return upper
+	}
+	return "OTHER"
+}
+
+// CanonicalizeRoute collapses dynamic or arbitrary URLs into bounded route labels.
+// Query parameters are stripped and high-cardinality paths are grouped by prefix.
+func CanonicalizeRoute(route string) string {
+	if idx := strings.Index(route, "?"); idx != -1 {
+		route = route[:idx]
+	}
+	route = strings.TrimSpace(route)
+	switch {
+	case route == "" || route == "/":
+		return "/"
+	case strings.HasPrefix(route, "/api/send-request"):
+		return "/api/send-request"
+	case strings.HasPrefix(route, "/api/status"):
+		return "/api/status"
+	case strings.HasPrefix(route, "/api/strategy"):
+		return "/api/strategy"
+	case strings.HasPrefix(route, "/api/metrics"):
+		return "/api/metrics"
+	case strings.HasPrefix(route, "/api/events"):
+		return "/api/events"
+	case strings.HasPrefix(route, "/api/backends"):
+		return "/api/backends"
+	case strings.HasPrefix(route, "/bench"):
+		return "/bench"
+	case strings.HasPrefix(route, "/health"):
+		return "/health"
+	default:
+		return "OTHER"
+	}
+}
+
 // RequestTracker manages monotonic counters, in-flight connections, categorized errors,
-// and latency distributions for hot-path request execution.
+// latency distributions, payload sizes, and workload features for hot-path request execution.
 type RequestTracker struct {
 	activeConns   int64
 	totalRequests uint64
@@ -45,63 +98,96 @@ type RequestTracker struct {
 	lastEMAUpdate time.Time
 	emaMu         sync.RWMutex
 
-	// Method and route mix tracking
+	// Method and route mix tracking (bounded)
 	mixMu        sync.RWMutex
 	methodCounts map[string]uint64
 	routeCounts  map[string]uint64
+
+	// Workload features: long requests, payload size bounds, and workload classes
+	longReqThresholdNs int64 // time.Duration in nanoseconds
+	longRequests       uint64
+	longReqWindow      *RollingWindow
+
+	maxRequestBytes  uint64
+	maxResponseBytes uint64
+
+	classShortWindow   *RollingWindow
+	classLongWindow    *RollingWindow
+	classComputeWindow *RollingWindow
+	classShortCount    uint64
+	classLongCount     uint64
+	classComputeCount  uint64
 }
 
 // ActiveRequest captures metadata for an in-flight request, including timestamps
-// for overhead and upstream backend latency separation.
+// for overhead and upstream backend latency separation, without storing sensitive bodies or client IP.
 type ActiveRequest struct {
 	StartTime      time.Time
 	ProxyStartTime time.Time
 	Method         string
 	Route          string
+	IsComputeHeavy bool
 }
 
-// NewRequestTracker constructs a high-performance request tracker.
+// NewRequestTracker constructs a high-performance request tracker with default thresholds.
 func NewRequestTracker(windowDuration time.Duration) *RequestTracker {
 	if windowDuration <= 0 {
 		windowDuration = 10 * time.Second
 	}
 	return &RequestTracker{
-		reqWindow:         NewRollingWindow(windowDuration, 10),
-		errWindow:         NewRollingWindow(windowDuration, 10),
-		completedWindow:   NewRollingWindow(windowDuration, 10),
-		histogram:         NewLatencyHistogram(),
-		backendHistogram:  NewLatencyHistogram(),
-		overheadHistogram: NewLatencyHistogram(),
-		rpsEMA:            NewMultiEMA(),
-		errRateEMA:        NewMultiEMA(),
-		p50EMA:            NewMultiEMA(),
-		p95EMA:            NewMultiEMA(),
-		p99EMA:            NewMultiEMA(),
-		methodCounts:      make(map[string]uint64),
-		routeCounts:       make(map[string]uint64),
+		reqWindow:          NewRollingWindow(windowDuration, 10),
+		errWindow:          NewRollingWindow(windowDuration, 10),
+		completedWindow:    NewRollingWindow(windowDuration, 10),
+		longReqWindow:      NewRollingWindow(windowDuration, 10),
+		classShortWindow:   NewRollingWindow(windowDuration, 10),
+		classLongWindow:    NewRollingWindow(windowDuration, 10),
+		classComputeWindow: NewRollingWindow(windowDuration, 10),
+		histogram:          NewLatencyHistogram(),
+		backendHistogram:   NewLatencyHistogram(),
+		overheadHistogram:  NewLatencyHistogram(),
+		rpsEMA:             NewMultiEMA(),
+		errRateEMA:         NewMultiEMA(),
+		p50EMA:             NewMultiEMA(),
+		p95EMA:             NewMultiEMA(),
+		p99EMA:             NewMultiEMA(),
+		methodCounts:       make(map[string]uint64),
+		routeCounts:        make(map[string]uint64),
+		longReqThresholdNs: int64(100 * time.Millisecond),
 	}
 }
 
-// StartRequest atomically increments active in-flight connections and monotonic counter.
-func (t *RequestTracker) StartRequest(method, route string) *ActiveRequest {
+// StartRequest atomically increments active in-flight connections and monotonic counter,
+// mapping method and route to canonical bounded categories.
+func (t *RequestTracker) StartRequest(method, route string, isComputeHeavy ...bool) *ActiveRequest {
 	atomic.AddInt64(&t.activeConns, 1)
 	atomic.AddUint64(&t.totalRequests, 1)
 	t.reqWindow.Add(1)
 
+	canonicalMethod := CanonicalizeMethod(method)
+	canonicalRoute := CanonicalizeRoute(route)
+
 	// Record method & route under read/write lock
 	t.mixMu.Lock()
-	if method != "" {
-		t.methodCounts[method]++
+	if canonicalMethod != "" {
+		t.methodCounts[canonicalMethod]++
 	}
-	if route != "" {
-		t.routeCounts[route]++
+	if canonicalRoute != "" {
+		t.routeCounts[canonicalRoute]++
 	}
 	t.mixMu.Unlock()
 
+	heavy := false
+	if len(isComputeHeavy) > 0 && isComputeHeavy[0] {
+		heavy = true
+	} else if strings.Contains(route, "delay") {
+		heavy = true
+	}
+
 	return &ActiveRequest{
-		StartTime: time.Now(),
-		Method:    method,
-		Route:     route,
+		StartTime:      time.Now(),
+		Method:         canonicalMethod,
+		Route:          canonicalRoute,
+		IsComputeHeavy: heavy,
 	}
 }
 
@@ -113,8 +199,9 @@ func (t *RequestTracker) MarkProxyStart(req *ActiveRequest) {
 	}
 }
 
-// EndRequest atomically decrements active connections and records latency, throughput, and errors.
-func (t *RequestTracker) EndRequest(req *ActiveRequest, statusCode int, err error, bytesIn, bytesOut uint64) time.Duration {
+// EndRequest atomically decrements active connections and records latency, throughput,
+// workload classes, payload sizes, and errors.
+func (t *RequestTracker) EndRequest(req *ActiveRequest, statusCode int, err error, bytesIn, bytesOut uint64, isComputeHeavy ...bool) time.Duration {
 	atomic.AddInt64(&t.activeConns, -1)
 	t.completedWindow.Add(1)
 
@@ -137,13 +224,50 @@ func (t *RequestTracker) EndRequest(req *ActiveRequest, statusCode int, err erro
 		t.histogram.Record(duration)
 		t.backendHistogram.Record(backendDuration)
 		t.overheadHistogram.Record(overheadDuration)
+
+		// Long-request tracking
+		thresh := time.Duration(atomic.LoadInt64(&t.longReqThresholdNs))
+		if thresh <= 0 {
+			thresh = 100 * time.Millisecond
+		}
+		if duration >= thresh {
+			atomic.AddUint64(&t.longRequests, 1)
+			t.longReqWindow.Add(1)
+		}
+
+		// Workload classes
+		heavy := (req != nil && req.IsComputeHeavy) || (len(isComputeHeavy) > 0 && isComputeHeavy[0])
+		if heavy {
+			atomic.AddUint64(&t.classComputeCount, 1)
+			t.classComputeWindow.Add(1)
+		}
+		if duration < 50*time.Millisecond {
+			atomic.AddUint64(&t.classShortCount, 1)
+			t.classShortWindow.Add(1)
+		}
+		if duration >= thresh {
+			atomic.AddUint64(&t.classLongCount, 1)
+			t.classLongWindow.Add(1)
+		}
 	}
 
 	if bytesIn > 0 {
 		atomic.AddUint64(&t.bytesReceived, bytesIn)
+		for {
+			cur := atomic.LoadUint64(&t.maxRequestBytes)
+			if bytesIn <= cur || atomic.CompareAndSwapUint64(&t.maxRequestBytes, cur, bytesIn) {
+				break
+			}
+		}
 	}
 	if bytesOut > 0 {
 		atomic.AddUint64(&t.bytesSent, bytesOut)
+		for {
+			cur := atomic.LoadUint64(&t.maxResponseBytes)
+			if bytesOut <= cur || atomic.CompareAndSwapUint64(&t.maxResponseBytes, cur, bytesOut) {
+				break
+			}
+		}
 	}
 
 	// Categorize failures consistently
@@ -194,6 +318,106 @@ func ClassifyFailure(statusCode int, err error) (ErrorCategory, bool) {
 	}
 
 	return "", false
+}
+
+// SetLongRequestThreshold configures the duration boundary defining a long request.
+func (t *RequestTracker) SetLongRequestThreshold(d time.Duration) {
+	if d <= 0 {
+		d = 100 * time.Millisecond
+	}
+	atomic.StoreInt64(&t.longReqThresholdNs, int64(d))
+}
+
+// GetLongRequestThreshold returns the active long request duration boundary.
+func (t *RequestTracker) GetLongRequestThreshold() time.Duration {
+	v := atomic.LoadInt64(&t.longReqThresholdNs)
+	if v <= 0 {
+		return 100 * time.Millisecond
+	}
+	return time.Duration(v)
+}
+
+// GetWorkloadFeatures extracts dynamic traffic characteristics, trends, sizes, and classes.
+func (t *RequestTracker) GetWorkloadFeatures() WorkloadFeatures {
+	thresh := t.GetLongRequestThreshold()
+	completed := t.completedWindow.Sum()
+	longReqCount := t.longReqWindow.Sum()
+
+	longFraction := 0.0
+	if completed > 0 {
+		longFraction = math.Min(1.0, float64(longReqCount)/float64(completed))
+	}
+
+	// Workload classes
+	shortCount := t.classShortWindow.Sum()
+	longClassCount := t.classLongWindow.Sum()
+	computeCount := t.classComputeWindow.Sum()
+
+	classCounts := map[string]uint64{
+		"short":         shortCount,
+		"long-running":  longClassCount,
+		"compute-heavy": computeCount,
+	}
+
+	classFractions := map[string]float64{
+		"short":         0.0,
+		"long-running":  0.0,
+		"compute-heavy": 0.0,
+	}
+	if completed > 0 {
+		classFractions["short"] = math.Min(1.0, float64(shortCount)/float64(completed))
+		classFractions["long-running"] = math.Min(1.0, float64(longClassCount)/float64(completed))
+		classFractions["compute-heavy"] = math.Min(1.0, float64(computeCount)/float64(completed))
+	}
+
+	// RPS Trend
+	rawRPS := t.GetRPS()
+	t.emaMu.RLock()
+	emaRPS := t.rpsEMA.ema01.Value()
+	t.emaMu.RUnlock()
+
+	trend := "stable"
+	derivative := 0.0
+	if emaRPS > 0.05 {
+		derivative = (rawRPS - emaRPS) / emaRPS
+		if derivative > 0.15 {
+			trend = "rising"
+		} else if derivative < -0.15 {
+			trend = "falling"
+		}
+	}
+
+	// Payload sizes
+	totIn, totOut := t.GetBytes()
+	totReqs := t.GetTotalRequests()
+	avgReqSize := 0.0
+	avgRespSize := 0.0
+	if totReqs > 0 {
+		avgReqSize = float64(totIn) / float64(totReqs)
+	}
+	if completed > 0 {
+		avgRespSize = float64(totOut) / float64(completed)
+	}
+
+	payloadStats := PayloadSizeStats{
+		TotalBytesIn:         totIn,
+		TotalBytesOut:        totOut,
+		AvgRequestSizeBytes:  avgReqSize,
+		AvgResponseSizeBytes: avgRespSize,
+		MaxRequestSizeBytes:  atomic.LoadUint64(&t.maxRequestBytes),
+		MaxResponseSizeBytes: atomic.LoadUint64(&t.maxResponseBytes),
+	}
+
+	return WorkloadFeatures{
+		RPSTrend:               trend,
+		RPSDerivative:          derivative,
+		LongRequestThresholdMs: durationToMs(thresh),
+		LongRequestCount:       longReqCount,
+		LongRequestFraction:    longFraction,
+		PayloadSizes:           payloadStats,
+		WorkloadClassCounts:    classCounts,
+		WorkloadClassFractions: classFractions,
+	}
 }
 
 // GetActiveConnections returns current in-flight connections.
@@ -343,7 +567,7 @@ func (t *RequestTracker) GetSmoothedP99() SmoothedValue {
 	return v
 }
 
-// GetMethodMix returns a snapshot of requests broken down by HTTP method.
+// GetMethodMix returns a snapshot of requests broken down by bounded HTTP method.
 func (t *RequestTracker) GetMethodMix() map[string]uint64 {
 	t.mixMu.RLock()
 	defer t.mixMu.RUnlock()
@@ -354,7 +578,7 @@ func (t *RequestTracker) GetMethodMix() map[string]uint64 {
 	return res
 }
 
-// GetRouteMix returns a snapshot of requests broken down by route.
+// GetRouteMix returns a snapshot of requests broken down by bounded route.
 func (t *RequestTracker) GetRouteMix() map[string]uint64 {
 	t.mixMu.RLock()
 	defer t.mixMu.RUnlock()

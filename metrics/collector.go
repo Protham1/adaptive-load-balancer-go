@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,8 +54,23 @@ func NewMetricsCollector(windowDuration time.Duration) *MetricsCollector {
 	}
 }
 
-// RegisterBackend adds a backend to tracking with its capacity specifications.
+// RegisterBackend adds a backend to tracking with its capacity specifications and default benchmark expectations.
 func (c *MetricsCollector) RegisterBackend(id, url string, weight, cpuCores int, memLimit uint64, connLimit int64) {
+	class := "standard"
+	if cpuCores >= 8 || weight >= 3 {
+		class = "large"
+	} else if cpuCores >= 4 || weight >= 2 {
+		class = "medium"
+	} else {
+		class = "small"
+	}
+	benchmarkRPS := float64(weight) * 10000.0
+	benchmarkP95Ms := 2.5
+	c.RegisterBackendWithCapacity(id, url, weight, cpuCores, memLimit, connLimit, class, benchmarkRPS, benchmarkP95Ms)
+}
+
+// RegisterBackendWithCapacity adds a backend with declared capacity class and empirical benchmark validations.
+func (c *MetricsCollector) RegisterBackendWithCapacity(id, url string, weight, cpuCores int, memLimit uint64, connLimit int64, class string, benchmarkRPS, benchmarkP95Ms float64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -64,12 +80,18 @@ func (c *MetricsCollector) RegisterBackend(id, url string, weight, cpuCores int,
 	c.backendHealth[id] = true
 	c.backendURLs[id] = url
 	c.capacityConfigs[id] = &BackendCapacityConfig{
-		BackendID:        id,
-		URL:              url,
-		StaticWeight:     weight,
-		CPUCores:         cpuCores,
-		MemoryLimitBytes: memLimit,
-		ConnectionLimit:  connLimit,
+		BackendID:                id,
+		URL:                      url,
+		StaticWeight:             weight,
+		DeclaredCapacityClass:    class,
+		CPUCores:                 cpuCores,
+		MemoryLimitBytes:         memLimit,
+		ConnectionLimit:          connLimit,
+		IsEligible:               true,
+		BenchmarkRPS:             benchmarkRPS,
+		BenchmarkP95Ms:           benchmarkP95Ms,
+		ObservedVsBenchmarkRatio: 0.0,
+		HardwareVsEmpiricalScore: 1.0,
 	}
 }
 
@@ -98,29 +120,29 @@ func (c *MetricsCollector) RecordProbe(id string, healthy bool, duration time.Du
 }
 
 // RecordRequestStart begins tracking a request globally and for the specific backend.
-func (c *MetricsCollector) RecordRequestStart(backendID, method, route string) *ActiveRequest {
-	c.globalTracker.StartRequest(method, route)
+func (c *MetricsCollector) RecordRequestStart(backendID, method, route string, isComputeHeavy ...bool) *ActiveRequest {
+	c.globalTracker.StartRequest(method, route, isComputeHeavy...)
 
 	c.mu.RLock()
 	tracker, exists := c.backendTrackers[backendID]
 	c.mu.RUnlock()
 
 	if exists && tracker != nil {
-		return tracker.StartRequest(method, route)
+		return tracker.StartRequest(method, route, isComputeHeavy...)
 	}
-	return &ActiveRequest{StartTime: time.Now(), Method: method, Route: route}
+	return &ActiveRequest{StartTime: time.Now(), Method: CanonicalizeMethod(method), Route: CanonicalizeRoute(route)}
 }
 
 // RecordRequestEnd completes tracking a request, updating error classifications and latencies.
-func (c *MetricsCollector) RecordRequestEnd(backendID string, req *ActiveRequest, statusCode int, err error, bytesIn, bytesOut uint64) time.Duration {
-	c.globalTracker.EndRequest(req, statusCode, err, bytesIn, bytesOut)
+func (c *MetricsCollector) RecordRequestEnd(backendID string, req *ActiveRequest, statusCode int, err error, bytesIn, bytesOut uint64, isComputeHeavy ...bool) time.Duration {
+	c.globalTracker.EndRequest(req, statusCode, err, bytesIn, bytesOut, isComputeHeavy...)
 
 	c.mu.RLock()
 	tracker, exists := c.backendTrackers[backendID]
 	c.mu.RUnlock()
 
 	if exists && tracker != nil {
-		return tracker.EndRequest(req, statusCode, err, bytesIn, bytesOut)
+		return tracker.EndRequest(req, statusCode, err, bytesIn, bytesOut, isComputeHeavy...)
 	}
 
 	if req != nil && !req.StartTime.IsZero() {
@@ -191,6 +213,7 @@ func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 		Window:                globalWindow,
 		MethodMix:             c.globalTracker.GetMethodMix(),
 		RouteMix:              c.globalTracker.GetRouteMix(),
+		Workload:              c.globalTracker.GetWorkloadFeatures(),
 		WindowSeconds:         c.windowDuration.Seconds(),
 	}
 
@@ -198,6 +221,11 @@ func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 	c.mu.RLock()
 	backends := make(map[string]*BackendRuntimeMetrics, len(c.backendTrackers))
 	capacity := make(map[string]*BackendCapacityConfig, len(c.capacityConfigs))
+
+	for id, cfg := range c.capacityConfigs {
+		cp := *cfg
+		capacity[id] = &cp
+	}
 
 	for id, tracker := range c.backendTrackers {
 		u := c.backendURLs[id]
@@ -208,12 +236,43 @@ func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 		bLatency := tracker.GetLatencyStats()
 		bBackendLatency := tracker.GetBackendLatencyStats()
 		bOverhead := tracker.GetOverheadLatencyStats()
+		activeConns := tracker.GetActiveConnections()
+		currentRPS := tracker.GetRPS()
+
+		// Evaluate eligibility: healthy AND connection limit not breached
+		eligible := healthy
+		capCfg := capacity[id]
+		if capCfg != nil {
+			if capCfg.ConnectionLimit > 0 && activeConns >= capCfg.ConnectionLimit {
+				eligible = false
+			}
+			capCfg.IsEligible = eligible
+
+			// Benchmark validation: ratio of runtime RPS to benchmarked RPS
+			if capCfg.BenchmarkRPS > 0 {
+				capCfg.ObservedVsBenchmarkRatio = currentRPS / capCfg.BenchmarkRPS
+			}
+
+			// Hardware vs Empirical score
+			if capCfg.BenchmarkRPS > 0 && capCfg.StaticWeight > 0 {
+				expectedRPSPerWeight := capCfg.BenchmarkRPS / float64(capCfg.StaticWeight)
+				if expectedRPSPerWeight > 0 {
+					actualRPSPerWeight := currentRPS / float64(capCfg.StaticWeight)
+					score := actualRPSPerWeight / expectedRPSPerWeight
+					if math.IsNaN(score) || math.IsInf(score, 0) {
+						score = 1.0
+					}
+					capCfg.HardwareVsEmpiricalScore = score
+				}
+			}
+		}
 
 		backends[id] = &BackendRuntimeMetrics{
 			BackendID:        id,
 			URL:              u,
 			Healthy:          healthy,
-			ActiveConns:      tracker.GetActiveConnections(),
+			Eligible:         eligible,
+			ActiveConns:      activeConns,
 			TotalRequests:    tracker.GetTotalRequests(),
 			TotalErrors:      tracker.GetTotalErrors(),
 			ErrorsByCategory: tracker.GetErrorBreakdown(),
@@ -226,14 +285,10 @@ func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 			LatencyP50:       tracker.GetSmoothedP50(),
 			LatencyP95:       tracker.GetSmoothedP95(),
 			LatencyP99:       tracker.GetSmoothedP99(),
+			Capacity:         capCfg,
 			WindowSeconds:    c.windowDuration.Seconds(),
 			LastUpdated:      now,
 		}
-	}
-
-	for id, cfg := range c.capacityConfigs {
-		cp := *cfg
-		capacity[id] = &cp
 	}
 	c.mu.RUnlock()
 

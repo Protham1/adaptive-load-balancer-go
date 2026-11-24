@@ -137,10 +137,11 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 			Timestamp:   time.Now().UnixMilli(),
 		})
 
+		isCompute := r.Header.Get("X-Simulated-Delay") != "" || r.URL.Query().Get("delay") != "" || strings.Contains(r.URL.Path, "compute")
 		col := pool.GetCollector()
 		var activeReq *metrics.ActiveRequest
 		if col != nil {
-			activeReq = col.RecordRequestStart(peer.Name, r.Method, r.URL.Path)
+			activeReq = col.RecordRequestStart(peer.Name, r.Method, r.URL.Path, isCompute)
 		}
 
 		inBytes := uint64(0)
@@ -163,7 +164,7 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 				reqErr = fmt.Errorf("http error %d", status)
 			}
 			if col != nil {
-				col.RecordRequestEnd(peer.Name, activeReq, status, reqErr, inBytes, capturedWriter.bytesWritten)
+				col.RecordRequestEnd(peer.Name, activeReq, status, reqErr, inBytes, capturedWriter.bytesWritten, isCompute)
 			}
 
 			// Broadcast complete event
@@ -340,20 +341,22 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 			targetURL += "/?delay=" + body.Delay
 		}
 
+		isCompute := body.Delay != ""
 		col := pool.GetCollector()
 		var activeReq *metrics.ActiveRequest
 		if col != nil {
-			activeReq = col.RecordRequestStart(peer.Name, http.MethodGet, targetURL)
+			activeReq = col.RecordRequestStart(peer.Name, http.MethodGet, targetURL, isCompute)
 		}
 
 		start := time.Now()
 		respStatusCode := http.StatusOK
 		var respErr error
+		bytesWritten := uint64(0)
 
 		defer func() {
 			conns := peer.DecConns()
 			if col != nil {
-				col.RecordRequestEnd(peer.Name, activeReq, respStatusCode, respErr, 0, 0)
+				col.RecordRequestEnd(peer.Name, activeReq, respStatusCode, respErr, 0, bytesWritten, isCompute)
 			}
 			eventBus.Publish(RequestEvent{
 				ID:          reqID,
