@@ -283,7 +283,80 @@ flowchart TD
 
 ---
 
-## 6. Architectural Summary & Best Practices
+## 6. Phase 4 — Build and Version the State Representation
+
+### 6.1 Objectives
+1. Define a fixed, versioned state feature vector (`State v1`) ensuring strict agreement between Go telemetry and downstream AI/RL agents.
+2. Guarantee deterministic backend ordering via lexicographical sorting (`BackendID`) so ordering never changes silently.
+3. Apply physically meaningful normalization bounds:
+   - CPU and memory fractions in $[0.0, 1.0]$.
+   - Error fractions in $[0.0, 1.0]$.
+   - Latencies scaled against a documented scale ($500\text{ms}$) and clipped to $[0.0, 1.0]$.
+   - Rates normalized via log scaling ($\frac{\ln(1+x)}{\ln(1+\text{max})}$) for wide dynamic ranges.
+4. Handle missing and stale telemetry values:
+   - Attach timestamps and a maximum allowed age ($5.0\text{s}$) to every snapshot.
+   - Use explicit missing indicators (`cpu_is_missing`, `memory_is_missing`) alongside conservative defaults.
+   - If critical features are stale, recommend retaining the last safe policy rather than exploring aggressively.
+5. Expose REST endpoints: `GET /api/state` and `GET /api/state/schema`.
+
+### 6.2 State v1 Specification & Layout
+
+The State v1 contract comprises 4 global features followed by 8 features per configured backend sorted lexicographically by `BackendID`:
+
+```text
+Global Features (4):
+  0: global.rps_normalized                 [0.0, 1.0] - log(1 + RPS) / log(1 + MaxRefRPS)
+  1: global.request_duration_p95_normalized [0.0, 1.0] - min(1.0, P95Ms / LatencyScaleMs)
+  2: global.long_request_ratio             [0.0, 1.0] - long_requests / completed_requests
+  3: global.global_error_rate              [0.0, 1.0] - total_errors / total_requests
+
+Per-Backend Features (8 per backend in stable BackendID order):
+  0: backend[id].healthy                      [0.0, 1.0] - 1.0 if eligible, 0.5 if saturated, 0.0 if down
+  1: backend[id].cpu_utilization              [0.0, 1.0] - CPU% / 100.0 (conservative 0.5 if missing)
+  2: backend[id].memory_utilization           [0.0, 1.0] - used_bytes / total_bytes
+  3: backend[id].active_connections_normalized[0.0, 1.0] - active_conns / connection_limit
+  4: backend[id].backend_rps_normalized       [0.0, 1.0] - log(1 + RPS) / log(1 + MaxRefRPS)
+  5: backend[id].p95_latency_normalized       [0.0, 1.0] - min(1.0, P95Ms / LatencyScaleMs)
+  6: backend[id].error_rate                   [0.0, 1.0] - backend_errors / max(backend_requests, 1)
+  7: backend[id].capacity_ratio               [0.0, 1.0] - static_weight / total_weight
+```
+
+### 6.3 Versioned Scaler Configuration (`StateScalerConfig`)
+To guarantee consistency across model training and online inference:
+```go
+type StateScalerConfig struct {
+    Version           string  `json:"version"`             // "v1"
+    LatencyScaleMs    float64 `json:"latency_scale_ms"`     // 500.0 ms
+    MaxReferenceRPS   float64 `json:"max_reference_rps"`    // 2000.0 req/s
+    MaxConnectionsRef float64 `json:"max_connections_ref"`  // 100.0
+    UseLogScaleRPS    bool    `json:"use_log_scale_rps"`    // true
+    MaxAllowedAgeSec  float64 `json:"max_allowed_age_sec"`  // 5.0 s
+}
+```
+
+### 6.4 Staleness Detection & Safe Policy Fallback
+* Every state snapshot calculates `snapshot_age_ms = now - timestamp`.
+* If `snapshot_age_ms > max_allowed_age_ms` (default $5000\text{ms}$):
+  * `is_stale = true`
+  * `safe_policy_retain_recommended = true`
+  * `staleness_reason` documents the age breach.
+* If sample counts are below statistical threshold (`IsValid = false`):
+  * `has_missing_critical_features = true`
+  * `safe_policy_retain_recommended = true`
+* The adaptive controller adheres to `safe_policy_retain_recommended` to freeze strategy switching during network disconnects or telemetry delays.
+
+### 6.5 Endpoints: `GET /api/state` & `GET /api/state/schema`
+* `GET /api/state`: Returns the structured `StateRepresentation` including version, staleness metadata, structured fields, sorted backend IDs, and the 1D `flattened_vector`.
+* `GET /api/state/schema`: Returns formal metadata for each feature index, min/max bounds, units, and scaling formula descriptions.
+
+### 6.6 Important Conclusions
+1. Sorting backend feature blocks lexicographically guarantees that feature vector indices never shift unpredictably when backends are added or removed.
+2. Log scaling ($\log(1+x)$) effectively prevents extreme traffic bursts from compressing normal load variations into a narrow band.
+3. Explicit staleness detection provides a crucial safeguard preventing reinforcement learning agents from taking erratic exploratory actions on outdated telemetry.
+
+---
+
+## 7. Architectural Summary & Best Practices
 
 ```mermaid
 flowchart LR
@@ -302,15 +375,17 @@ flowchart LR
     
     LB --> Upstream
     
-    subgraph Telemetry["Unified Telemetry"]
+    subgraph Telemetry["Unified Telemetry & State Engine"]
         Collector["MetricsCollector"]
-        API["GET /api/metrics"]
-        Vector["ML Vectors: Backend (8D) + Workload (9D)"]
+        StateEngine["State v1 Builder (state.go)"]
+        API["GET /api/metrics & GET /api/state"]
+        Vector["Versioned 1D Flattened Vector"]
     end
     
     Tracker --> Collector
-    Collector --> API
-    Collector --> Vector
+    Collector --> StateEngine
+    StateEngine --> API
+    StateEngine --> Vector
 ```
 
 ### Engineering Best Practices Implemented
@@ -319,14 +394,15 @@ flowchart LR
 3. **Serialization Boundaries**: Time durations remain strict `time.Duration` throughout the core engine and are converted to milliseconds solely during JSON encoding.
 4. **Cardinated Bounded Guarantees**: Method and route dimensions are strictly bounded to prevent heap exhaustion.
 5. **Zero Data Leakage**: Sensitive payload contents and client identities are excluded from telemetry pipelines.
+6. **Deterministic State Versioning**: Feature ordering is fixed, versioned (`v1`), and strictly sorted by `BackendID`.
 
 ---
 
-## 7. Next Steps & Road Ahead
+## 8. Next Steps & Road Ahead
 
-* **Phase 4 — Adaptive Controller & Policy Engine**:
-  * Implement heuristic and machine-learning controllers consuming `BackendFeatureVector` and `WorkloadFeatureVector`.
+* **Phase 5 — Adaptive Controller & Policy Engine**:
+  * Implement heuristic and machine-learning controllers consuming `FlattenedVector` from `GET /api/state`.
   * Trigger dynamic strategy switching based on real-time load, backend latency divergence, and error bursts.
-  * Honor `FallbackRecommended` and `Eligible` flags to keep strategies stable during low-traffic windows.
-* **Phase 5 — Controlled Fault Injection & Stress Evaluation**:
+  * Honor `safe_policy_retain_recommended` to freeze strategy transitions whenever telemetry is stale or invalid.
+* **Phase 6 — Controlled Fault Injection & Stress Evaluation**:
   * Evaluate adaptive controller behavior against static baselines under traffic surges, backend degradation, and network partitions.

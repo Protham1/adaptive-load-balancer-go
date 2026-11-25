@@ -29,6 +29,10 @@ type MetricsCollector struct {
 	lastDecisionTime time.Duration
 	policyVersion    string
 	switchCount      uint64
+
+	// State scaler configuration (Phase 4)
+	scalerMu     sync.RWMutex
+	scalerConfig StateScalerConfig
 }
 
 // NewMetricsCollector initializes a unified collector with the specified aggregation window.
@@ -51,6 +55,7 @@ func NewMetricsCollector(windowDuration time.Duration) *MetricsCollector {
 		currentStrategy:     "Round-Robin",
 		lastSwitchAt:        now,
 		policyVersion:       "1.0.0-baseline",
+		scalerConfig:        DefaultStateScalerConfig(),
 	}
 }
 
@@ -320,4 +325,25 @@ func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 		CapacityConfigs:     capacity,
 		Controller:          controller,
 	}
+}
+
+// SetStateScalerConfig configures the normalization constants for state vector generation.
+func (c *MetricsCollector) SetStateScalerConfig(cfg StateScalerConfig) {
+	c.scalerMu.Lock()
+	defer c.scalerMu.Unlock()
+	c.scalerConfig = cfg
+}
+
+// GetStateScalerConfig returns the active normalization configuration.
+func (c *MetricsCollector) GetStateScalerConfig() StateScalerConfig {
+	c.scalerMu.RLock()
+	defer c.scalerMu.RUnlock()
+	return c.scalerConfig
+}
+
+// GetStateRepresentation returns a fixed, versioned feature vector with deterministic backend ordering.
+func (c *MetricsCollector) GetStateRepresentation(maxBackends ...int) *StateRepresentation {
+	snap := c.CollectSnapshot()
+	cfg := c.GetStateScalerConfig()
+	return BuildStateRepresentation(snap, cfg, maxBackends...)
 }

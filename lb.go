@@ -274,6 +274,19 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(col.CollectSnapshot())
 
+	case r.URL.Path == "/api/state" && r.Method == http.MethodGet:
+		col := pool.GetCollector()
+		if col == nil {
+			http.Error(w, `{"error":"metrics collector not configured"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(col.GetStateRepresentation())
+
+	case r.URL.Path == "/api/state/schema" && r.Method == http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(metrics.GetStateSchema(metrics.CurrentStateVersion))
+
 	case r.URL.Path == "/api/events" && r.Method == http.MethodGet:
 		flusher, ok := w.(http.Flusher)
 		if !ok {

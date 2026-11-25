@@ -20,6 +20,34 @@ func MinMaxNormalize(val, min, max float64) float64 {
 	return (val - min) / (max - min)
 }
 
+// LogScaleNormalize scales a positive value x in [0, max] to [0.0, 1.0] using log scaling:
+// log(1 + x) / log(1 + max). Useful for wide dynamic range signals like RPS or request counts.
+func LogScaleNormalize(val, max float64) float64 {
+	if val <= 0.0 {
+		return 0.0
+	}
+	if max <= 0.0 {
+		return 0.0
+	}
+	if val >= max {
+		return 1.0
+	}
+	return math.Log(1.0+val) / math.Log(1.0+max)
+}
+
+// LatencyScaleNormalize scales a duration or millisecond latency against a documented reference scale,
+// clipping the result strictly to [0.0, 1.0].
+func LatencyScaleNormalize(latencyMs, scaleMs float64) float64 {
+	if latencyMs <= 0.0 || scaleMs <= 0.0 {
+		return 0.0
+	}
+	ratio := latencyMs / scaleMs
+	if ratio >= 1.0 {
+		return 1.0
+	}
+	return ratio
+}
+
 // ZScoreNormalize scales a value using mean and standard deviation.
 // Safely returns 0.0 when standard deviation is zero.
 func ZScoreNormalize(val, mean, stdDev float64) float64 {

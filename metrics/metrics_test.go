@@ -739,3 +739,184 @@ func TestWorkloadFeatureVector(t *testing.T) {
 		}
 	}
 }
+
+func TestStateRepresentationV1Structure(t *testing.T) {
+	col := NewMetricsCollector(5 * time.Second)
+	// Register 3 backends out of lexicographical order to verify stable sorting
+	col.RegisterBackend("backend-3", "http://localhost:8083", 1, 1, 1024, 50)
+	col.RegisterBackend("backend-1", "http://localhost:8081", 3, 4, 4096, 100)
+	col.RegisterBackend("backend-2", "http://localhost:8082", 2, 2, 2048, 75)
+
+	// Send requests to populate metrics
+	for i := 0; i < 6; i++ {
+		req := col.RecordRequestStart("backend-1", "GET", "/api/data")
+		col.RecordRequestEnd("backend-1", req, 200, nil, 100, 200)
+	}
+	for i := 0; i < 4; i++ {
+		req := col.RecordRequestStart("backend-2", "POST", "/api/submit")
+		col.RecordRequestEnd("backend-2", req, 200, nil, 200, 300)
+	}
+	for i := 0; i < 2; i++ {
+		req := col.RecordRequestStart("backend-3", "GET", "/health")
+		col.RecordRequestEnd("backend-3", req, 200, nil, 50, 50)
+	}
+
+	state := col.GetStateRepresentation()
+
+	if state.StateVersion != CurrentStateVersion {
+		t.Errorf("expected state version %s, got %s", CurrentStateVersion, state.StateVersion)
+	}
+
+	// 1. Verify stable, deterministic backend ordering
+	expectedOrder := []string{"backend-1", "backend-2", "backend-3"}
+	if len(state.OrderedBackendIDs) != 3 {
+		t.Fatalf("expected 3 ordered backend IDs, got %d", len(state.OrderedBackendIDs))
+	}
+	for i, id := range expectedOrder {
+		if state.OrderedBackendIDs[i] != id {
+			t.Errorf("backend[%d] expected %s, got %s (non-deterministic ordering!)", i, id, state.OrderedBackendIDs[i])
+		}
+		if state.Backends[i].BackendID != id {
+			t.Errorf("state.Backends[%d] expected %s, got %s", i, id, state.Backends[i].BackendID)
+		}
+	}
+
+	// 2. Global features verification
+	if state.Global.RPSNormalized < 0.0 || state.Global.RPSNormalized > 1.0 {
+		t.Errorf("RPSNormalized outside [0, 1]: %f", state.Global.RPSNormalized)
+	}
+	if state.Global.RequestDurationP95Normalized < 0.0 || state.Global.RequestDurationP95Normalized > 1.0 {
+		t.Errorf("RequestDurationP95Normalized outside [0, 1]: %f", state.Global.RequestDurationP95Normalized)
+	}
+	if state.Global.GlobalErrorRate != 0.0 {
+		t.Errorf("expected 0 error rate, got %f", state.Global.GlobalErrorRate)
+	}
+
+	// 3. Flattened vector length: 4 global + 3 backends * 8 features = 28
+	expectedLen := 4 + 3*8
+	if len(state.FlattenedVector) != expectedLen {
+		t.Fatalf("expected flattened vector length %d, got %d", expectedLen, len(state.FlattenedVector))
+	}
+	if len(state.FeatureNames) != expectedLen {
+		t.Fatalf("expected feature names length %d, got %d", expectedLen, len(state.FeatureNames))
+	}
+
+	// 4. Validate all elements in flattened vector are bounded in [0.0, 1.0]
+	for idx, val := range state.FlattenedVector {
+		if val < 0.0 || val > 1.0 {
+			t.Errorf("feature %s (index %d) has out-of-bounds value %f", state.FeatureNames[idx], idx, val)
+		}
+	}
+
+	// 5. Check JSON serializability
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatalf("failed to marshal state to JSON: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("failed to decode state JSON: %v", err)
+	}
+	if decoded["state_version"] != CurrentStateVersion {
+		t.Errorf("expected JSON state_version %s, got %v", CurrentStateVersion, decoded["state_version"])
+	}
+}
+
+func TestStateStalenessAndSafePolicyRetain(t *testing.T) {
+	col := NewMetricsCollector(5 * time.Second)
+	col.RegisterBackend("b1", "http://localhost:8081", 1, 2, 1000, 50)
+
+	// 1. Fresh state
+	freshState := col.GetStateRepresentation()
+	if freshState.IsStale {
+		t.Errorf("expected fresh state not to be stale")
+	}
+
+	// 2. Stale state via synthetic snapshot timestamp older than MaxAllowedAgeSec
+	cfg := DefaultStateScalerConfig()
+	cfg.MaxAllowedAgeSec = 2.0 // 2 seconds threshold
+	col.SetStateScalerConfig(cfg)
+
+	snap := col.CollectSnapshot()
+	snap.Timestamp = time.Now().Add(-5 * time.Second) // 5 seconds old
+
+	staleState := BuildStateRepresentation(snap, cfg)
+	if !staleState.IsStale {
+		t.Errorf("expected snapshot older than 2s to be marked stale")
+	}
+	if !staleState.SafePolicyRetainRecommended {
+		t.Errorf("expected safe policy retain recommended when stale")
+	}
+	if staleState.StalenessReason == "" {
+		t.Errorf("expected non-empty staleness reason")
+	}
+}
+
+func TestStateFixedPadding(t *testing.T) {
+	col := NewMetricsCollector(5 * time.Second)
+	col.RegisterBackend("b1", "http://localhost:8081", 1, 2, 1000, 50)
+	col.RegisterBackend("b2", "http://localhost:8082", 2, 4, 2000, 50)
+
+	// Request fixed size with maxBackends = 5
+	state := col.GetStateRepresentation(5)
+
+	// Total length: 4 global + 5 backends * 8 = 44
+	expectedLen := 4 + 5*8
+	if len(state.FlattenedVector) != expectedLen {
+		t.Fatalf("expected padded vector length %d, got %d", expectedLen, len(state.FlattenedVector))
+	}
+	if len(state.FeatureNames) != expectedLen {
+		t.Fatalf("expected padded feature names length %d, got %d", expectedLen, len(state.FeatureNames))
+	}
+
+	// Verify padding slots have 0.0 values
+	for i := 4 + 2*8; i < expectedLen; i++ {
+		if state.FlattenedVector[i] != 0.0 {
+			t.Errorf("expected 0.0 for padded feature %s, got %f", state.FeatureNames[i], state.FlattenedVector[i])
+		}
+	}
+}
+
+func TestStateSchemaMetadata(t *testing.T) {
+	schema := GetStateSchema("v1")
+	if schema.StateVersion != CurrentStateVersion {
+		t.Errorf("expected schema version %s, got %s", CurrentStateVersion, schema.StateVersion)
+	}
+	if schema.GlobalFeatureCount != 4 {
+		t.Errorf("expected 4 global features, got %d", schema.GlobalFeatureCount)
+	}
+	if schema.PerBackendCount != 8 {
+		t.Errorf("expected 8 per-backend features, got %d", schema.PerBackendCount)
+	}
+	if len(schema.Features) != 12 {
+		t.Errorf("expected 12 feature definitions in schema, got %d", len(schema.Features))
+	}
+}
+
+func TestLogScaleAndLatencyScaleNormalize(t *testing.T) {
+	// LogScaleNormalize
+	if val := LogScaleNormalize(0, 1000); val != 0.0 {
+		t.Errorf("expected 0.0 for 0, got %f", val)
+	}
+	val := LogScaleNormalize(1000, 1000)
+	if val < 0.999 || val > 1.001 {
+		t.Errorf("expected 1.0 for max, got %f", val)
+	}
+	if valClamped := LogScaleNormalize(5000, 1000); valClamped != 1.0 {
+		t.Errorf("expected 1.0 clamped for exceeding max, got %f", valClamped)
+	}
+	if valMid := LogScaleNormalize(100, 1000); valMid <= 0.0 || valMid >= 1.0 {
+		t.Errorf("expected middle value in (0, 1), got %f", valMid)
+	}
+
+	// LatencyScaleNormalize
+	if val := LatencyScaleNormalize(0, 500); val != 0.0 {
+		t.Errorf("expected 0.0, got %f", val)
+	}
+	if val := LatencyScaleNormalize(250, 500); val != 0.5 {
+		t.Errorf("expected 0.5 for 250/500, got %f", val)
+	}
+	if val := LatencyScaleNormalize(1000, 500); val != 1.0 {
+		t.Errorf("expected 1.0 clamped for 1000/500, got %f", val)
+	}
+}

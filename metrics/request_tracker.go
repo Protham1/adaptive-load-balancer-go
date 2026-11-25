@@ -51,6 +51,8 @@ func CanonicalizeRoute(route string) string {
 		return "/api/strategy"
 	case strings.HasPrefix(route, "/api/metrics"):
 		return "/api/metrics"
+	case strings.HasPrefix(route, "/api/state"):
+		return "/api/state"
 	case strings.HasPrefix(route, "/api/events"):
 		return "/api/events"
 	case strings.HasPrefix(route, "/api/backends"):

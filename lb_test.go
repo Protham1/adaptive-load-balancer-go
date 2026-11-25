@@ -500,5 +500,45 @@ func TestMetricsAPIEndpoint(t *testing.T) {
 	if snapshot.Backends[b.Name] == nil {
 		t.Errorf("expected metrics for backend %s, got nil", b.Name)
 	}
+
+	// Request /api/state
+	stateReq := httptest.NewRequest(http.MethodGet, "/api/state", nil)
+	stateRec := httptest.NewRecorder()
+	handler.ServeHTTP(stateRec, stateReq)
+
+	if stateRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/state, got %d", stateRec.Code)
+	}
+
+	var state metrics.StateRepresentation
+	if err := json.Unmarshal(stateRec.Body.Bytes(), &state); err != nil {
+		t.Fatalf("failed to decode state JSON: %v", err)
+	}
+	if state.StateVersion != "v1" {
+		t.Errorf("expected state_version v1, got %s", state.StateVersion)
+	}
+	if len(state.OrderedBackendIDs) != 1 || state.OrderedBackendIDs[0] != b.Name {
+		t.Errorf("unexpected ordered backend IDs: %v", state.OrderedBackendIDs)
+	}
+	if len(state.FlattenedVector) != 4+8 { // 4 global + 8 backend features
+		t.Errorf("expected flattened vector length 12, got %d", len(state.FlattenedVector))
+	}
+
+	// Request /api/state/schema
+	schemaReq := httptest.NewRequest(http.MethodGet, "/api/state/schema", nil)
+	schemaRec := httptest.NewRecorder()
+	handler.ServeHTTP(schemaRec, schemaReq)
+
+	if schemaRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/state/schema, got %d", schemaRec.Code)
+	}
+
+	var schema metrics.StateSchemaMetadata
+	if err := json.Unmarshal(schemaRec.Body.Bytes(), &schema); err != nil {
+		t.Fatalf("failed to decode schema JSON: %v", err)
+	}
+	if schema.StateVersion != "v1" || schema.GlobalFeatureCount != 4 {
+		t.Errorf("unexpected schema metadata: %+v", schema)
+	}
 }
 
