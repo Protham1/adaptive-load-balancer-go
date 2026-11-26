@@ -1,0 +1,55 @@
+{
+ "schema_version": 1,
+ "decision_id": "window-00042",
+ "state_version": 1,
+ "observed_at": "2026-10-13T16:00:00Z",
+ "window_seconds": 30,
+ "current_strategy": "round_robin",
+ "allowed_strategies": [
+  "round_robin",
+  "round_robin"
+ ],
+ "features": {
+  "global": {
+   "rps_normalized": 0.4,
+   "request_duration_p95_normalized": 0.1,
+   "long_request_ratio": 0.0,
+   "global_error_rate": 0.0
+  },
+  "backends": [
+   {
+    "id": "Backend-1",
+    "healthy": 1.0,
+    "cpu_utilization": 0.4,
+    "memory_utilization": 0.3,
+    "active_connections_normalized": 0.1,
+    "backend_rps_normalized": 0.2,
+    "p95_latency_normalized": 0.05,
+    "error_rate": 0.0,
+    "capacity_ratio": 0.5
+   },
+   {
+    "id": "Backend-2",
+    "healthy": 1.0,
+    "cpu_utilization": 0.4,
+    "memory_utilization": 0.3,
+    "active_connections_normalized": 0.2,
+    "backend_rps_normalized": 0.2,
+    "p95_latency_normalized": 0.05,
+    "error_rate": 0.0,
+    "capacity_ratio": 0.33
+   },
+   {
+    "id": "Backend-3",
+    "healthy": 1.0,
+    "cpu_utilization": 0.4,
+    "memory_utilization": 0.3,
+    "active_connections_normalized": 0.30000000000000004,
+    "backend_rps_normalized": 0.2,
+    "p95_latency_normalized": 0.05,
+    "error_rate": 0.0,
+    "capacity_ratio": 0.17
+   }
+  ]
+ }
+}

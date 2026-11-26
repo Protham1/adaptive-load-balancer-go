@@ -84,6 +84,7 @@ type Policy struct {
 	BackendIDs []string     `json:"backend_ids,omitempty"`
 	Version    uint64       `json:"version"`
 	CreatedAt  time.Time    `json:"created_at"`
+	Reason     string       `json:"reason,omitempty"` // reason code recorded with the publication
 
 	index map[string]float64 // built once at publish, never mutated
 }

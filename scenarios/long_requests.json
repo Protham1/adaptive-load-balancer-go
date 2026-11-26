@@ -1,0 +1,22 @@
+{
+ "name": "long_requests",
+ "description": "20% of requests hold a connection for 400 ms; fast requests are 20 ms; compare Least-Connections with the others.",
+ "seed": 42,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 60,
+   "rps": 300
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.2,
+  "long_delay_ms": 400,
+  "short_delay_ms": 0
+ },
+ "faults": [],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

@@ -1,0 +1,90 @@
+{
+ "scenario": "latency_degradation",
+ "summary": {
+  "completed_rps_avg": 302.4695452080481,
+  "completed_total": 18154,
+  "dropped_by_generator": 0,
+  "duration_s": 60.0192657,
+  "error_rate": 0.021593037347141127,
+  "errors_total": 392,
+  "generator_ok": true,
+  "latency_ok_p95_ms": 666.4519,
+  "latency_p50_ms": 22.296799999999998,
+  "latency_p95_ms": 661.7123,
+  "latency_p99_ms": 716.5197,
+  "offered_rps_avg": 302.56666666666666,
+  "offered_total": 18154,
+  "schedule_lag_max_ms": 21.978949,
+  "schedule_lag_p50_ms": 0.359978,
+  "schedule_lag_p99_ms": 1.374031,
+  "sent_total": 18154
+ },
+ "strategies_seen": [
+  "Adaptive-Weighted-Round-Robin",
+  "Least-Connections",
+  "Round-Robin",
+  "Smooth-Weighted-Round-Robin"
+ ],
+ "policy_versions": [
+  2,
+  5
+ ],
+ "faults_ok": true,
+ "fault_backend": "Backend-2",
+ "phases": {
+  "before": {
+   "window_s": [
+    5,
+    15.003709
+   ],
+   "offered_rps": 298.27272727272725,
+   "completed_rps": 298.09090909090907,
+   "error_rate": 0.0,
+   "p95_ms_mean": 48.961681818181816,
+   "p99_ms_mean": 56.52491818181819
+  },
+  "during": {
+   "window_s": [
+    21.003709,
+    45.0004189
+   ],
+   "offered_rps": 306.2916666666667,
+   "completed_rps": 306.4166666666667,
+   "error_rate": 0.053304324177318466,
+   "p95_ms_mean": 521.5332875,
+   "p99_ms_mean": 528.7188583333333
+  },
+  "after": {
+   "window_s": [
+    53.0004189,
+    59.0192657
+   ],
+   "offered_rps": 293.1666666666667,
+   "completed_rps": 293.8333333333333,
+   "error_rate": 0.0,
+   "p95_ms_mean": 24.261866666666666,
+   "p99_ms_mean": 26.7589
+  }
+ },
+ "traffic_share_of_fault_backend": {
+  "before": 0.3335554815061646,
+  "during": 0.23381040102026357,
+  "after": 0.2799097065462754
+ },
+ "agent": {
+  "stats": {
+   "requests": 4,
+   "successes": 4,
+   "failures_by_kind": {},
+   "held_stale_state": 0,
+   "last_latency_ms": 18.95,
+   "max_latency_ms": 30.911,
+   "avg_latency_ms": 17.968500000000002
+  },
+  "manager_reasons": {
+   "applied": 3,
+   "rejected_min_policy_age": 1
+  },
+  "safety_events": null
+ }
+}

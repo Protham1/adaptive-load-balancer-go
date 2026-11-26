@@ -1,52 +1,21 @@
 package main
 
 import (
-	"fmt"
+	"adaptive-load/dummy"
 	"log"
-	"net/http"
-	"sync/atomic"
-	"time"
 )
 
-// StartDummyBackend launches an HTTP server on the given port for demonstration purposes
+// StartDummyBackend launches an in-process fault-injectable demo backend.
+// Fault control is served on port+1000 (see package dummy).
 func StartDummyBackend(port string, name string) {
-	var requestCount uint64
+	StartDummyBackendWith(dummy.DefaultConfig(name, port))
+}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Optional simulated processing delay for testing Least Connections
-		if delayStr := r.Header.Get("X-Simulated-Delay"); delayStr != "" {
-			if d, err := time.ParseDuration(delayStr); err == nil {
-				time.Sleep(d)
-			}
-		} else if delayStr := r.URL.Query().Get("delay"); delayStr != "" {
-			if d, err := time.ParseDuration(delayStr); err == nil {
-				time.Sleep(d)
-			}
-		}
-
-		count := atomic.AddUint64(&requestCount, 1)
-		msg := fmt.Sprintf("Response from %s (Port %s) | Request Count: %d\n", name, port, count)
-		log.Printf("[%s] Handled request #%d", name, count)
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(msg))
-	})
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK\n"))
-	})
-
-	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: mux,
+// StartDummyBackendWith launches an in-process backend with an explicit configuration.
+func StartDummyBackendWith(cfg dummy.Config) {
+	if _, err := dummy.Start(cfg); err != nil {
+		log.Printf("Backend %s failed to start: %v", cfg.Name, err)
+		return
 	}
-
-	go func() {
-		log.Printf("Starting %s on http://localhost:%s", name, port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("Server %s stopped: %v", name, err)
-		}
-	}()
+	log.Printf("Started %s on http://localhost:%s (fault control :%s)", cfg.Name, cfg.Port, cfg.ControlPort)
 }

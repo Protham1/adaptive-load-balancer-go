@@ -1,0 +1,65 @@
+{
+ "scenario": "flash_crowd",
+ "summary": {
+  "completed_rps_avg": 554.286386341,
+  "completed_total": 33270,
+  "dropped_by_generator": 0,
+  "duration_s": 60.0231231,
+  "error_rate": 0,
+  "errors_total": 0,
+  "generator_ok": true,
+  "latency_ok_p95_ms": 26.834899999999998,
+  "latency_p50_ms": 21.8719,
+  "latency_p95_ms": 26.834899999999998,
+  "latency_p99_ms": 43.7617,
+  "offered_rps_avg": 554.5,
+  "offered_total": 33270,
+  "schedule_lag_max_ms": 35.53602,
+  "schedule_lag_p50_ms": 0.321762,
+  "schedule_lag_p99_ms": 4.3557,
+  "sent_total": 33270
+ },
+ "strategies_seen": [
+  "Least-Connections"
+ ],
+ "policy_versions": [
+  3,
+  3
+ ],
+ "faults_ok": true,
+ "phases": {
+  "base": {
+   "window_s": [
+    5,
+    15
+   ],
+   "offered_rps": 200.7,
+   "completed_rps": 200.7,
+   "error_rate": 0.0,
+   "p95_ms_mean": 29.24848,
+   "p99_ms_mean": 42.95788
+  },
+  "peak": {
+   "window_s": [
+    30,
+    50
+   ],
+   "offered_rps": 862.75,
+   "completed_rps": 863.3,
+   "error_rate": 0.0,
+   "p95_ms_mean": 29.825445000000002,
+   "p99_ms_mean": 39.31064
+  },
+  "end": {
+   "window_s": [
+    48.0231231,
+    58.0231231
+   ],
+   "offered_rps": 326.3,
+   "completed_rps": 327.6,
+   "error_rate": 0.0,
+   "p95_ms_mean": 27.014480000000002,
+   "p99_ms_mean": 34.10901
+  }
+ }
+}

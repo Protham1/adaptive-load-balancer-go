@@ -1,0 +1,38 @@
+{
+ "name": "cpu_pressure",
+ "description": "CPU burner on Backend-1 (8 threads, 90% duty) from t=15s to t=45s; expect rising tail latency on that backend.",
+ "seed": 42,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 60,
+   "rps": 300
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.0,
+  "long_delay_ms": 0,
+  "short_delay_ms": 0
+ },
+ "faults": [
+  {
+   "at_s": 15,
+   "backend": "Backend-1",
+   "set": {
+    "cpu_burn": 0.9,
+    "cpu_threads": 8
+   }
+  },
+  {
+   "at_s": 45,
+   "backend": "Backend-1",
+   "set": {
+    "cpu_burn": 0
+   }
+  }
+ ],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

@@ -1,0 +1,38 @@
+{
+ "name": "error_injection",
+ "description": "Backend-3 returns 503 for 30% of requests from t=15s to t=45s (seeded); expect error penalty / safety logic to activate.",
+ "seed": 42,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 60,
+   "rps": 300
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.0,
+  "long_delay_ms": 0,
+  "short_delay_ms": 0
+ },
+ "faults": [
+  {
+   "at_s": 15,
+   "backend": "Backend-3",
+   "set": {
+    "error_rate": 0.3,
+    "seed": 7
+   }
+  },
+  {
+   "at_s": 45,
+   "backend": "Backend-3",
+   "set": {
+    "error_rate": 0
+   }
+  }
+ ],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

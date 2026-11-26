@@ -301,6 +301,42 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "decision_id": body.DecisionID, "policy": pool.Policies().Current()})
 
+	case r.URL.Path == "/api/agent" && r.Method == http.MethodGet:
+		ag := pool.GetAgent()
+		w.Header().Set("Content-Type", "application/json")
+		if ag == nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"enabled": false})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(ag.Status())
+
+	case r.URL.Path == "/api/agent/kill" && r.Method == http.MethodPost:
+		ag := pool.GetAgent()
+		if ag == nil {
+			http.Error(w, `{"error":"agent not configured"}`, http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			Kill           *bool `json:"kill"`
+			BaselineAction *int  `json:"baseline_action"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Kill == nil {
+			http.Error(w, `invalid request body: expected {"kill": true|false, "baseline_action": <0..4, optional>}`, http.StatusBadRequest)
+			return
+		}
+		var base *policy.ActionID
+		if body.BaselineAction != nil {
+			a := policy.ActionID(*body.BaselineAction)
+			base = &a
+		}
+		if err := ag.mgr.Kill(*body.Kill, base, time.Now()); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		log.Printf("[LoadBalancer] AI kill switch set to %v", *body.Kill)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "killed": ag.mgr.IsKilled(), "policy": pool.Policies().Current()})
+
 	case r.URL.Path == "/api/controller" && r.Method == http.MethodGet:
 		ctrl := pool.GetController()
 		if ctrl == nil {

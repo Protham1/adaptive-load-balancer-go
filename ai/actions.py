@@ -11,6 +11,9 @@ ACTION_STRATEGIES = (
     "Consistent-Hash",  # 3 (affinity only)
     "Adaptive-Weighted-Round-Robin",  # 4 (rule-based baseline)
 )
+# Wire names of the Go<->Python contract (schema v1), index = action ID.
+WIRE_NAMES = ("round_robin", "least_connections", "static_swrr", "consistent_hash", "rule_based_adaptive")
+WIRE_TO_ACTION = {n: i for i, n in enumerate(WIRE_NAMES)}
 STRATEGY_TO_ACTION = {s: i for i, s in enumerate(ACTION_STRATEGIES)}
 RR, LC, STATIC_SWRR, CH, RULE_ADAPTIVE = range(5)
 

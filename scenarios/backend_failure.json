@@ -1,0 +1,30 @@
+{
+ "name": "backend_failure",
+ "description": "Backend-2 stops accepting connections at t=15s (and stays down); expect the health system to exclude it quickly.",
+ "seed": 42,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 60,
+   "rps": 300
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.0,
+  "long_delay_ms": 0,
+  "short_delay_ms": 0
+ },
+ "faults": [
+  {
+   "at_s": 15,
+   "backend": "Backend-2",
+   "set": {
+    "down": true
+   }
+  }
+ ],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

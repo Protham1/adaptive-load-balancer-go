@@ -1,0 +1,44 @@
+{
+ "name": "flash_crowd",
+ "description": "Offered load ramps 200 -> 900 rps in 10 s, holds 20 s, then ramps back down; compare completed throughput with offered load.",
+ "seed": 42,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 15,
+   "rps": 200
+  },
+  {
+   "type": "ramp",
+   "duration_s": 10,
+   "from_rps": 200,
+   "to_rps": 900
+  },
+  {
+   "type": "fixed",
+   "duration_s": 20,
+   "rps": 900
+  },
+  {
+   "type": "ramp",
+   "duration_s": 10,
+   "from_rps": 900,
+   "to_rps": 200
+  },
+  {
+   "type": "fixed",
+   "duration_s": 5,
+   "rps": 200
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.0,
+  "long_delay_ms": 0,
+  "short_delay_ms": 0
+ },
+ "faults": [],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

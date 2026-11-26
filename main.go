@@ -1,7 +1,9 @@
 package main
 
 import (
+	"adaptive-load/agent"
 	"adaptive-load/controller"
+	"adaptive-load/dummy"
 	"adaptive-load/metrics"
 	"adaptive-load/strategy"
 	"context"
@@ -9,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -26,8 +29,14 @@ func main() {
 		{Port: "8083", Name: "Backend-3", Weight: 1},
 	}
 
-	for _, cfg := range backendConfigs {
-		StartDummyBackend(cfg.Port, cfg.Name)
+	// LB_NO_DUMMY=1: backends run as separate processes (go run ./cmd/backend), so CPU
+	// pressure and failures do not share a process with the load balancer.
+	if os.Getenv("LB_NO_DUMMY") != "1" {
+		for _, cfg := range backendConfigs {
+			dc := dummy.DefaultConfig(cfg.Name, cfg.Port)
+			dc.Concurrency = 8 * cfg.Weight // capacity proportional to the declared weight
+			StartDummyBackendWith(dc)
+		}
 	}
 
 	// Brief pause to allow backend servers to bind to ports
@@ -64,9 +73,30 @@ func main() {
 		func() *metrics.StateRepresentation { return metricsCollector.GetStateRepresentation() },
 		serverPool.PublishAdaptiveWeights)
 
+	// Phase 10-12: the active policy starts at the known-safe baseline BEFORE traffic is served.
+	agentCfg, mgrCfg := LoadAgentConfigFromEnv()
+	if err := serverPool.ApplyActionReason(mgrCfg.SafeAction, "startup_safe_baseline"); err != nil {
+		log.Fatalf("invalid safe baseline action %d: %v", mgrCfg.SafeAction, err)
+	}
+	log.Printf("Known-safe baseline active: %s", serverPool.GetStrategy().Name())
+	if agentCfg.URL != "" {
+		mgr := NewPolicyManager(serverPool, mgrCfg, time.Now())
+		ctl := NewAgentController(serverPool, metricsCollector, mgr, agent.NewClient(agentCfg.URL, agentCfg.RequestTimeout), agentCfg)
+		serverPool.SetAgent(ctl)
+		go ctl.Run(context.Background())
+		log.Printf("AI agent enabled: %s (timeout %v, min policy age %v, shadow=%v)",
+			agentCfg.URL, agentCfg.RequestTimeout, mgrCfg.MinPolicyAge, mgrCfg.Shadow)
+	} else {
+		log.Printf("AI agent disabled (set LB_AGENT_URL to enable)")
+	}
+
 	// 3. Start Periodic Background Health Check
+	healthEvery := 10 * time.Second
+	if v, err := strconv.Atoi(os.Getenv("LB_HEALTH_INTERVAL_MS")); err == nil && v > 0 {
+		healthEvery = time.Duration(v) * time.Millisecond
+	}
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(healthEvery)
 		for range ticker.C {
 			serverPool.HealthCheck()
 		}

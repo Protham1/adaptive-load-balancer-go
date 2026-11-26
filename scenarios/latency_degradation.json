@@ -1,0 +1,37 @@
+{
+ "name": "latency_degradation",
+ "description": "Backend-2 gains 200 ms of delay from t=15s to t=45s; expect p95/p99 and routing distribution to change.",
+ "seed": 42,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 60,
+   "rps": 300
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.0,
+  "long_delay_ms": 0,
+  "short_delay_ms": 0
+ },
+ "faults": [
+  {
+   "at_s": 15,
+   "backend": "Backend-2",
+   "set": {
+    "delay_ms": 200
+   }
+  },
+  {
+   "at_s": 45,
+   "backend": "Backend-2",
+   "set": {
+    "delay_ms": 0
+   }
+  }
+ ],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

@@ -27,6 +27,11 @@ func (s *Store) Current() *Policy { return s.cur.Load() }
 
 // Publish validates, copies, and atomically installs a new policy.
 func (s *Store) Publish(st StrategyType, ids []string, weights []float64) (*Policy, error) {
+	return s.PublishReason(st, ids, weights, "")
+}
+
+// PublishReason is Publish with a reason code recorded on the snapshot.
+func (s *Store) PublishReason(st StrategyType, ids []string, weights []float64, reason string) (*Policy, error) {
 	if _, ok := ActionForStrategy(st); !ok {
 		return nil, fmt.Errorf("policy: unknown strategy %q", st)
 	}
@@ -37,6 +42,7 @@ func (s *Store) Publish(st StrategyType, ids []string, weights []float64) (*Poli
 	defer s.mu.Unlock()
 	s.version++
 	p := newPolicy(st, ids, weights, s.version)
+	p.Reason = reason
 	s.cur.Store(p)
 	return p, nil
 }
@@ -45,6 +51,11 @@ func (s *Store) Publish(st StrategyType, ids []string, weights []float64) (*Poli
 // It returns (nil, false, nil) when the active strategy differs, so a stale
 // controller cannot overwrite a policy chosen in the meantime.
 func (s *Store) PublishWeightsIf(st StrategyType, ids []string, weights []float64) (*Policy, bool, error) {
+	return s.PublishWeightsIfReason(st, ids, weights, "")
+}
+
+// PublishWeightsIfReason is PublishWeightsIf with a reason code on the snapshot.
+func (s *Store) PublishWeightsIfReason(st StrategyType, ids []string, weights []float64, reason string) (*Policy, bool, error) {
 	if err := validateWeights(ids, weights); err != nil {
 		return nil, false, err
 	}
@@ -55,6 +66,7 @@ func (s *Store) PublishWeightsIf(st StrategyType, ids []string, weights []float6
 	}
 	s.version++
 	p := newPolicy(st, ids, weights, s.version)
+	p.Reason = reason
 	s.cur.Store(p)
 	return p, true, nil
 }

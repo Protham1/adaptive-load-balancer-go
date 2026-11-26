@@ -103,7 +103,7 @@ func (b *Backend) GetID() string {
 // ServerPool maintains information of all backends and active selection strategy
 type ServerPool struct {
 	backends  []*Backend
-	strategy  strategy.SelectionStrategy[*Backend]
+	active    atomic.Pointer[activeState] // lock-free read on the request path
 	collector *metrics.MetricsCollector
 	mux       sync.RWMutex
 
@@ -111,6 +111,31 @@ type ServerPool struct {
 	policies         *policy.Store
 	affinityRequired bool
 	ctrl             *controller.Controller // Phase 5 rule-based baseline (optional)
+	agentCtl         *AgentController       // Phase 10 AI decision loop (optional)
+}
+
+// SetAgent attaches the AI decision loop (for the status / kill-switch API).
+func (s *ServerPool) SetAgent(a *AgentController) {
+	s.mux.Lock()
+	s.agentCtl = a
+	s.mux.Unlock()
+}
+
+// GetAgent returns the AI decision loop, if configured.
+func (s *ServerPool) GetAgent() *AgentController {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return s.agentCtl
+}
+
+// activeState is the immutable pair the request path loads atomically: the
+// strategy instance in force and the version of the policy that selected it.
+// A policy swap builds a NEW strategy instance (no mutable state is shared
+// between old and new versions) and publishes a new activeState; requests that
+// already selected a backend are never cancelled or migrated.
+type activeState struct {
+	strat         strategy.SelectionStrategy[*Backend]
+	policyVersion uint64
 }
 
 // NewServerPool creates a new ServerPool with the specified SelectionStrategy.
@@ -119,10 +144,11 @@ func NewServerPool(strat strategy.SelectionStrategy[*Backend]) *ServerPool {
 	if strat == nil {
 		strat = strategy.NewRoundRobin[*Backend]()
 	}
-	return &ServerPool{
-		strategy: strat,
+	p := &ServerPool{
 		policies: policy.NewStore(policy.StrategyType(strat.Name())),
 	}
+	p.active.Store(&activeState{strat: strat, policyVersion: p.policies.Current().Version})
+	return p
 }
 
 // SetCollector attaches a metrics collector to the server pool.
@@ -142,14 +168,21 @@ func (s *ServerPool) GetCollector() *metrics.MetricsCollector {
 // SetStrategy updates the selection strategy dynamically and publishes the
 // matching immutable policy snapshot.
 func (s *ServerPool) SetStrategy(strat strategy.SelectionStrategy[*Backend]) {
+	s.SetStrategyWithReason(strat, "manual")
+}
+
+// SetStrategyWithReason is SetStrategy recording a reason code on the policy.
+// Order matters for atomic publication: the policy snapshot is published first,
+// then the active (strategy, version) pair is swapped in one atomic store.
+func (s *ServerPool) SetStrategyWithReason(strat strategy.SelectionStrategy[*Backend], reason string) {
 	if strat == nil {
 		return
 	}
 	start := time.Now()
 	s.mux.Lock()
-	s.strategy = strat
 	col := s.collector
-	ver := s.publishPolicyLocked(policy.StrategyType(strat.Name()))
+	ver := s.publishPolicyLocked(policy.StrategyType(strat.Name()), reason)
+	s.active.Store(&activeState{strat: strat, policyVersion: s.policies.Current().Version})
 	s.mux.Unlock()
 
 	if col != nil {
@@ -168,7 +201,7 @@ func (s *ServerPool) sortedBackendsLocked() []*Backend {
 
 // publishPolicyLocked publishes the policy for strategy st, with weights where
 // the strategy has them. Caller must hold s.mux. Returns the version string.
-func (s *ServerPool) publishPolicyLocked(st policy.StrategyType) string {
+func (s *ServerPool) publishPolicyLocked(st policy.StrategyType, reason string) string {
 	var ids []string
 	var weights []float64
 	switch st {
@@ -189,10 +222,10 @@ func (s *ServerPool) publishPolicyLocked(st policy.StrategyType) string {
 			ids, weights = s.ctrl.CurrentWeights()
 		}
 	}
-	p, err := s.policies.Publish(st, ids, weights)
+	p, err := s.policies.PublishReason(st, ids, weights, reason)
 	if err != nil {
 		// Weights were unusable: publish the strategy without weights rather than failing the switch.
-		if p, err = s.policies.Publish(st, nil, nil); err != nil {
+		if p, err = s.policies.PublishReason(st, nil, nil, reason); err != nil {
 			// Strategy outside the action space (e.g. a custom strategy): keep the prior policy.
 			p = s.policies.Current()
 		}
@@ -248,44 +281,84 @@ func (s *ServerPool) ValidateAction(a policy.ActionID) error {
 
 // ApplyAction validates the action and, if valid, activates its strategy.
 func (s *ServerPool) ApplyAction(a policy.ActionID) error {
+	return s.ApplyActionReason(a, "action")
+}
+
+// ApplyActionReason is ApplyAction recording a reason code on the new policy.
+func (s *ServerPool) ApplyActionReason(a policy.ActionID, reason string) error {
 	if err := s.ValidateAction(a); err != nil {
 		return err
 	}
 	st, _ := a.Strategy()
-	return s.SetStrategyByName(string(st))
+	return s.setStrategyByNameReason(string(st), reason)
 }
 
 // PublishAdaptiveWeights installs new dynamic weights, but only while the
 // adaptive strategy is active. It reports whether the weights were applied.
 func (s *ServerPool) PublishAdaptiveWeights(ids []string, weights []float64) bool {
+	_, ok := s.PublishAdaptiveWeightsReason(ids, weights, "rule_based")
+	return ok
+}
+
+// PublishAdaptiveWeightsReason is PublishAdaptiveWeights recording a reason code
+// and returning the published snapshot.
+func (s *ServerPool) PublishAdaptiveWeightsReason(ids []string, weights []float64, reason string) (*policy.Policy, bool) {
 	s.mux.RLock()
 	col := s.collector
 	s.mux.RUnlock()
-	p, ok, err := s.policies.PublishWeightsIf(policy.AdaptiveSWRR, ids, weights)
+	p, ok, err := s.policies.PublishWeightsIfReason(policy.AdaptiveSWRR, ids, weights, reason)
 	if err != nil || !ok {
-		return false
+		return nil, false
 	}
 	if col != nil {
 		col.SetPolicyVersion(policyVersionString(p))
 	}
-	return true
+	return p, true
+}
+
+// healthyCount returns the number of backends currently marked alive.
+func (s *ServerPool) healthyCount() int {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	n := 0
+	for _, b := range s.backends {
+		if b.IsAlive() {
+			n++
+		}
+	}
+	return n
+}
+
+// backendNames returns the configured backend names (unsorted copy).
+func (s *ServerPool) backendNames() []string {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	out := make([]string, len(s.backends))
+	for i, b := range s.backends {
+		out[i] = b.Name
+	}
+	return out
 }
 
 // SetStrategyByName updates the active strategy using its string identifier
 func (s *ServerPool) SetStrategyByName(name string) error {
+	return s.setStrategyByNameReason(name, "manual")
+}
+
+func (s *ServerPool) setStrategyByNameReason(name, reason string) error {
 	switch policy.StrategyType(name) {
 	case policy.RoundRobin:
-		s.SetStrategy(strategy.NewRoundRobin[*Backend]())
+		s.SetStrategyWithReason(strategy.NewRoundRobin[*Backend](), reason)
 	case policy.LeastConnections:
-		s.SetStrategy(strategy.NewLeastConnections[*Backend]())
+		s.SetStrategyWithReason(strategy.NewLeastConnections[*Backend](), reason)
 	case policy.StaticSWRR:
-		s.SetStrategy(strategy.NewSmoothWeightedRoundRobin[*Backend]())
+		s.SetStrategyWithReason(strategy.NewSmoothWeightedRoundRobin[*Backend](), reason)
 	case policy.ConsistentHash:
-		s.SetStrategy(strategy.NewConsistentHash[*Backend](100))
+		s.SetStrategyWithReason(strategy.NewConsistentHash[*Backend](100), reason)
 	case policy.AdaptiveSWRR:
-		s.SetStrategy(strategy.NewAdaptiveWeightedRoundRobin[*Backend](func() strategy.WeightLookup {
+		s.SetStrategyWithReason(strategy.NewAdaptiveWeightedRoundRobin[*Backend](func() strategy.WeightLookup {
 			return s.policies.Current()
-		}))
+		}), reason)
 	default:
 		return fmt.Errorf("unknown strategy: %s", name)
 	}
@@ -294,9 +367,7 @@ func (s *ServerPool) SetStrategyByName(name string) error {
 
 // GetStrategy returns the active selection strategy
 func (s *ServerPool) GetStrategy() strategy.SelectionStrategy[*Backend] {
-	s.mux.RLock()
-	defer s.mux.RUnlock()
-	return s.strategy
+	return s.active.Load().strat
 }
 
 // AddBackend adds a new backend server to the pool thread-safely
@@ -356,8 +427,8 @@ func (s *ServerPool) GetBackendByName(name string) *Backend {
 
 // GetNextPeer returns next active peer to execute a request via the active strategy
 func (s *ServerPool) GetNextPeer() *Backend {
+	strat := s.active.Load().strat
 	s.mux.RLock()
-	strat := s.strategy
 	backends := make([]*Backend, len(s.backends))
 	copy(backends, s.backends)
 	s.mux.RUnlock()
@@ -370,8 +441,8 @@ func (s *ServerPool) GetNextPeer() *Backend {
 
 // GetNextPeerWithKey returns next active peer considering a routing key (e.g. Client IP)
 func (s *ServerPool) GetNextPeerWithKey(key string) *Backend {
+	strat := s.active.Load().strat
 	s.mux.RLock()
-	strat := s.strategy
 	backends := make([]*Backend, len(s.backends))
 	copy(backends, s.backends)
 	s.mux.RUnlock()

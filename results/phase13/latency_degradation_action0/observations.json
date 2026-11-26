@@ -1,0 +1,71 @@
+{
+ "scenario": "latency_degradation",
+ "summary": {
+  "completed_rps_avg": 302.47375580309665,
+  "completed_total": 18154,
+  "dropped_by_generator": 0,
+  "duration_s": 60.0184302,
+  "error_rate": 0.045719951525834523,
+  "errors_total": 830,
+  "generator_ok": true,
+  "latency_ok_p95_ms": 707.3989,
+  "latency_p50_ms": 21.828,
+  "latency_p95_ms": 706.8367,
+  "latency_p99_ms": 719.1834,
+  "offered_rps_avg": 302.56666666666666,
+  "offered_total": 18154,
+  "schedule_lag_max_ms": 38.323917,
+  "schedule_lag_p50_ms": 0.347477,
+  "schedule_lag_p99_ms": 1.523839,
+  "sent_total": 18154
+ },
+ "strategies_seen": [
+  "Round-Robin"
+ ],
+ "policy_versions": [
+  3,
+  3
+ ],
+ "faults_ok": true,
+ "fault_backend": "Backend-2",
+ "phases": {
+  "before": {
+   "window_s": [
+    5,
+    15.00039
+   ],
+   "offered_rps": 298.27272727272725,
+   "completed_rps": 295.54545454545456,
+   "error_rate": 0.0,
+   "p95_ms_mean": 51.29464545454545,
+   "p99_ms_mean": 66.83007272727274
+  },
+  "during": {
+   "window_s": [
+    21.00039,
+    45.0001167
+   ],
+   "offered_rps": 306.2916666666667,
+   "completed_rps": 308.5833333333333,
+   "error_rate": 0.09424790710234944,
+   "p95_ms_mean": 714.0571458333334,
+   "p99_ms_mean": 720.4862583333334
+  },
+  "after": {
+   "window_s": [
+    53.0001167,
+    59.0184302
+   ],
+   "offered_rps": 293.1666666666667,
+   "completed_rps": 293.8333333333333,
+   "error_rate": 0.0,
+   "p95_ms_mean": 24.54386666666667,
+   "p99_ms_mean": 29.890383333333332
+  }
+ },
+ "traffic_share_of_fault_backend": {
+  "before": 0.3333333333333333,
+  "during": 0.3332860989088848,
+  "after": 0.3329571106094808
+ }
+}
