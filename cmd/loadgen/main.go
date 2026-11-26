@@ -35,6 +35,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -351,6 +352,15 @@ func parseBackendName(body []byte) string {
 	return string(rest[:j])
 }
 
+// normalizeTarget replaces the host name "localhost" by 127.0.0.1. Resolving the name for every new
+// connection uses a blocking resolver call per dial on Windows; under heavy timeouts (thousands of
+// concurrent dials) that exhausted the runtime's 10,000-thread limit and crashed the generator in the
+// first experiment pass. A literal IP removes the resolver from the measurement path.
+func normalizeTarget(t string) string {
+	t = strings.TrimRight(t, "/")
+	return strings.Replace(t, "//localhost", "//127.0.0.1", 1)
+}
+
 func syntheticIP(c int) string { return fmt.Sprintf("10.%d.%d.%d", (c>>16)&255, (c>>8)&255, c&255) }
 
 func categorize(status int, err error) string {
@@ -423,7 +433,8 @@ func main() {
 		fmt.Println("ok")
 		return
 	}
-	res, samples := run(&sc, strings.TrimRight(*target, "/"), parseCtrlMap(*ctrl), raw, *scale, *window, *sample)
+	debug.SetMaxThreads(100000) // backstop: never die of thread exhaustion mid-run
+	res, samples := run(&sc, normalizeTarget(*target), parseCtrlMap(*ctrl), raw, *scale, *window, *sample)
 	if *out != "" {
 		b, _ := json.MarshalIndent(res, "", " ")
 		if err := os.WriteFile(*out, b, 0o644); err != nil {

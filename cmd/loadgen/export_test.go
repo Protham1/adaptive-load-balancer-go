@@ -93,6 +93,17 @@ func TestParseBackendName(t *testing.T) {
 	}
 }
 
+func TestNormalizeTarget(t *testing.T) {
+	for in, want := range map[string]string{
+		"http://localhost:8080": "http://127.0.0.1:8080", "http://localhost:8080/": "http://127.0.0.1:8080",
+		"http://10.0.0.5:8080": "http://10.0.0.5:8080", "http://myhost:80": "http://myhost:80",
+	} {
+		if got := normalizeTarget(in); got != want {
+			t.Errorf("%s -> %s, want %s", in, got, want)
+		}
+	}
+}
+
 func TestSyntheticIPIsPrivateRange(t *testing.T) {
 	if ip := syntheticIP(258); ip != "10.0.1.2" {
 		t.Fatalf("got %s", ip)
