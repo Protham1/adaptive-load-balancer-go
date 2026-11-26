@@ -1,0 +1,39 @@
+{
+ "name": "e6_flash_crowd",
+ "description": "200 rps, ramp to 1400 rps over 8 s from t=10 s, hold 10 s, ramp down.",
+ "seed": 1000,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 10,
+   "rps": 200
+  },
+  {
+   "type": "ramp",
+   "duration_s": 8,
+   "from_rps": 200,
+   "to_rps": 1400
+  },
+  {
+   "type": "fixed",
+   "duration_s": 10,
+   "rps": 1400
+  },
+  {
+   "type": "ramp",
+   "duration_s": 8,
+   "from_rps": 1400,
+   "to_rps": 200
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.0,
+  "long_delay_ms": 0,
+  "short_delay_ms": 0
+ },
+ "faults": [],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

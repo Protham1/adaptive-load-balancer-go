@@ -17,6 +17,10 @@ import (
 
 var reqCounter uint64
 
+// quietRequestLog (LB_QUIET=1) suppresses the per-request log line so that
+// high-rate experiments do not spend CPU on logging.
+var quietRequestLog = os.Getenv("LB_QUIET") == "1"
+
 // getClientIP extracts the client IP address from proxy headers or remote address
 func getClientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
@@ -123,8 +127,10 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 		peer.IncTotalRequests()
 		stratName := pool.GetStrategy().Name()
 
-		log.Printf("[LoadBalancer] [%s] Forwarding %s %s -> %s (%s) (active: %d)",
-			reqID, r.Method, r.URL.Path, peer.Name, peer.URL, activeConns)
+		if !quietRequestLog {
+			log.Printf("[LoadBalancer] [%s] Forwarding %s %s -> %s (%s) (active: %d)",
+				reqID, r.Method, r.URL.Path, peer.Name, peer.URL, activeConns)
+		}
 
 		// Broadcast start event
 		eventBus.Publish(RequestEvent{

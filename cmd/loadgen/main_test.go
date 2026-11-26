@@ -15,13 +15,13 @@ func scenario() *Scenario {
 }
 
 func TestScheduleDeterministicForSeed(t *testing.T) {
-	a, b := buildSchedule(scenario()), buildSchedule(scenario())
+	a, b := buildSchedule(scenario(), 0), buildSchedule(scenario(), 0)
 	if !reflect.DeepEqual(a, b) || len(a) == 0 {
 		t.Fatal("same seed must give the same schedule")
 	}
 	s2 := scenario()
 	s2.Seed = 8
-	if reflect.DeepEqual(a, buildSchedule(s2)) {
+	if reflect.DeepEqual(a, buildSchedule(s2, 0)) {
 		t.Fatal("different seeds must differ")
 	}
 }
@@ -38,7 +38,7 @@ func countIn(sched []Arrival, lo, hi float64) int {
 
 func TestOfferedLoadFollowsPhases(t *testing.T) {
 	s := scenario()
-	sched := buildSchedule(s)
+	sched := buildSchedule(s, 0)
 	// fixed 100 rps for 10 s ~ 1000 (Poisson: +-15%)
 	if n := countIn(sched, 0, 10); math.Abs(float64(n)-1000) > 150 {
 		t.Errorf("fixed phase: %d", n)
@@ -59,7 +59,7 @@ func TestOfferedLoadFollowsPhases(t *testing.T) {
 
 func TestUniformArrivalsAreEvenlySpaced(t *testing.T) {
 	s := &Scenario{Seed: 1, Arrivals: "uniform", Phases: []Phase{{Type: "fixed", DurationS: 2, RPS: 50}}}
-	sched := buildSchedule(s)
+	sched := buildSchedule(s, 0)
 	if len(sched) < 98 || len(sched) > 100 {
 		t.Fatalf("expected ~99 arrivals, got %d", len(sched))
 	}
@@ -71,7 +71,7 @@ func TestUniformArrivalsAreEvenlySpaced(t *testing.T) {
 }
 
 func TestMixedDurations(t *testing.T) {
-	sched := buildSchedule(scenario())
+	sched := buildSchedule(scenario(), 0)
 	long := 0
 	for _, a := range sched {
 		if a.Long {

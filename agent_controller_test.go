@@ -249,6 +249,30 @@ func TestManagerSwitchMarginAndShadow(t *testing.T) {
 	}
 }
 
+func TestSwitchMarginDoesNotBlockFirstTimeExploration(t *testing.T) {
+	now := t0.Add(31 * time.Second)
+	f := func(v float64) *float64 { return &v }
+	// identical scores (cold model): without the exemption the learner could never leave the baseline
+	r := newRig(t, "Round-Robin", fastMgrCfg())
+	p := prop("least_connections", now)
+	p.Scores = []*float64{f(0.1), f(0.1), nil, nil, nil}
+	if res := r.mgr.Propose(p, now); res.Reason != ReasonSwitchMargin {
+		t.Fatalf("exploitation with no gain must be rejected: %+v", res)
+	}
+	p.Explored = true
+	if res := r.mgr.Propose(p, now); !res.Applied {
+		t.Fatalf("exploration must bypass the margin: %+v", res)
+	}
+	// ...but never the minimum policy age
+	r2 := newRig(t, "Round-Robin", fastMgrCfg())
+	early := t0.Add(5 * time.Second)
+	p2 := prop("least_connections", early)
+	p2.Explored = true
+	if res := r2.mgr.Propose(p2, early); res.Reason != ReasonMinPolicyAge {
+		t.Fatalf("exploration must still respect min policy age: %+v", res)
+	}
+}
+
 func TestManagerRetainedSame(t *testing.T) {
 	r := newRig(t, "Round-Robin", fastMgrCfg())
 	res := r.mgr.Propose(prop("round_robin", t0), t0)

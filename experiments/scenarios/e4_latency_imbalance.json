@@ -1,0 +1,30 @@
+{
+ "name": "e4_latency_imbalance",
+ "description": "Backend-2 gains +150 ms from t=12 s (sustained).",
+ "seed": 1000,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 36,
+   "rps": 600
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.0,
+  "long_delay_ms": 0,
+  "short_delay_ms": 0
+ },
+ "faults": [
+  {
+   "at_s": 12,
+   "backend": "Backend-2",
+   "set": {
+    "delay_ms": 150
+   }
+  }
+ ],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

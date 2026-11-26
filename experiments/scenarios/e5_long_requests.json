@@ -1,0 +1,22 @@
+{
+ "name": "e5_long_requests",
+ "description": "20% of requests hold a connection for 400 ms; 400 rps.",
+ "seed": 1000,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 36,
+   "rps": 400
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.2,
+  "long_delay_ms": 400,
+  "short_delay_ms": 0
+ },
+ "faults": [],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

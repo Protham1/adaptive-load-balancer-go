@@ -1,0 +1,24 @@
+{
+ "name": "a1_affinity",
+ "description": "Equal backends, 400 rps from 200 synthetic clients; affinity (stickiness) matters.",
+ "seed": 1000,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 36,
+   "rps": 400
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.0,
+  "long_delay_ms": 0,
+  "short_delay_ms": 0,
+  "clients": 200
+ },
+ "faults": [],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000,
+ "track_backend": true
+}

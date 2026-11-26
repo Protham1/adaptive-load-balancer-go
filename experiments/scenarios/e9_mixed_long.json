@@ -1,0 +1,63 @@
+{
+ "name": "mixed_long",
+ "description": "Ramp 400->800 rps with 10% long requests; CPU burner on Backend-1, +100 ms on Backend-3, Backend-2 down then restored.",
+ "seed": 1000,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 21.0,
+   "rps": 400
+  },
+  {
+   "type": "ramp",
+   "duration_s": 14.0,
+   "from_rps": 400,
+   "to_rps": 800
+  },
+  {
+   "type": "fixed",
+   "duration_s": 42.0,
+   "rps": 800
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.1,
+  "long_delay_ms": 300,
+  "short_delay_ms": 0
+ },
+ "faults": [
+  {
+   "at_s": 24.5,
+   "backend": "Backend-1",
+   "set": {
+    "cpu_burn": 0.9,
+    "cpu_threads": 2
+   }
+  },
+  {
+   "at_s": 35.0,
+   "backend": "Backend-3",
+   "set": {
+    "delay_ms": 100
+   }
+  },
+  {
+   "at_s": 49.0,
+   "backend": "Backend-2",
+   "set": {
+    "down": true
+   }
+  },
+  {
+   "at_s": 63.0,
+   "backend": "Backend-2",
+   "set": {
+    "down": false
+   }
+  }
+ ],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

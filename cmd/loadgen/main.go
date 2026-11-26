@@ -1,7 +1,7 @@
 // Command loadgen is a separate-process, open-loop workload generator with fault
-// scheduling (Phase 13).
+// scheduling and measurement export (Phases 13-14).
 //
-//	go run ./cmd/loadgen -scenario scenarios/flash_crowd.json -target http://localhost:8080 -out results/flash_crowd.json
+//	go run ./cmd/loadgen -scenario experiments/scenarios/e6_flash_crowd.json -target http://localhost:8080 -out run/loadgen.json
 //
 // Properties required by the plan:
 //   - fixed RPS, ramp-up, bursts, and mixed request durations (fast + long requests);
@@ -10,20 +10,33 @@
 //   - fixed seed, and the scenario configuration is echoed into the output;
 //   - the generator measures its own scheduling lag and dropped sends, and reports
 //     generator_ok=false if it became the bottleneck.
+//
+// Measurement export (kept small and privacy-safe: no request bodies, no real
+// client identities):
+//   - windows: per-window counters and a LOG-BUCKET LATENCY HISTOGRAM of
+//     successful requests (one methodology for every percentile; see histogram below);
+//   - failures are categorised: http_5xx, http_4xx, timeout, transport;
+//   - optional sampling (-sample, -samples-out) of individual requests;
+//   - optional affinity tracking for workloads with synthetic client ids.
 package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,16 +44,17 @@ import (
 
 // Scenario is the on-disk scenario configuration.
 type Scenario struct {
-	Name        string       `json:"name"`
-	Description string       `json:"description"`
-	Seed        int64        `json:"seed"`
-	Path        string       `json:"request_path"`
-	Arrivals    string       `json:"arrivals"` // "poisson" (default) or "uniform"
-	Phases      []Phase      `json:"phases"`
-	Mix         Mix          `json:"mix"`
-	Faults      []FaultEvent `json:"faults"`
-	TimeoutMs   int          `json:"timeout_ms"`
-	MaxInFlight int          `json:"max_in_flight"`
+	Name         string       `json:"name"`
+	Description  string       `json:"description"`
+	Seed         int64        `json:"seed"`
+	Path         string       `json:"request_path"`
+	Arrivals     string       `json:"arrivals"` // "poisson" (default) or "uniform"
+	Phases       []Phase      `json:"phases"`
+	Mix          Mix          `json:"mix"`
+	Faults       []FaultEvent `json:"faults"`
+	TimeoutMs    int          `json:"timeout_ms"`
+	MaxInFlight  int          `json:"max_in_flight"`
+	TrackBackend bool         `json:"track_backend"` // read the responding backend's name from the body
 }
 
 // Phase is one segment of the offered-load schedule.
@@ -55,11 +69,12 @@ type Phase struct {
 	BurstLenS   float64 `json:"burst_len_s"`
 }
 
-// Mix describes the request-duration mix.
+// Mix describes the request-duration mix and (optionally) synthetic clients.
 type Mix struct {
 	LongFraction float64 `json:"long_fraction"`
 	LongDelayMs  int     `json:"long_delay_ms"`
 	ShortDelayMs int     `json:"short_delay_ms"`
+	Clients      int     `json:"clients"` // >0: requests carry a synthetic X-Forwarded-For (affinity workload)
 }
 
 // FaultEvent applies fault settings to a backend at a scenario time.
@@ -98,6 +113,9 @@ func (s *Scenario) validate() error {
 	}
 	if s.Mix.LongFraction < 0 || s.Mix.LongFraction > 1 {
 		return fmt.Errorf("mix.long_fraction must be in [0,1]")
+	}
+	if s.Mix.Clients < 0 || s.Mix.Clients > 1000000 {
+		return fmt.Errorf("mix.clients out of range")
 	}
 	for i, f := range s.Faults {
 		if f.AtS < 0 || f.AtS > total {
@@ -164,11 +182,17 @@ type Arrival struct {
 	T       float64
 	Long    bool
 	DelayMs int
+	Client  int  // synthetic client id (only if mix.clients > 0)
+	Sample  bool // selected for the request-sample file
 }
 
-// buildSchedule pre-computes the seeded arrival schedule (open loop).
-func buildSchedule(s *Scenario) []Arrival {
+// buildSchedule pre-computes the seeded arrival schedule (open loop). Clients and
+// sampling use separate generators so that enabling them never changes the
+// arrival times or the long/short mix of a scenario.
+func buildSchedule(s *Scenario, sampleRate float64) []Arrival {
 	rng := rand.New(rand.NewSource(s.Seed))
+	crng := rand.New(rand.NewSource(s.Seed + 7919))
+	srng := rand.New(rand.NewSource(s.Seed + 104729))
 	total := s.duration()
 	var out []Arrival
 	t := 0.0
@@ -190,16 +214,69 @@ func buildSchedule(s *Scenario) []Arrival {
 		if rng.Float64() < s.Mix.LongFraction {
 			a.Long, a.DelayMs = true, s.Mix.LongDelayMs
 		}
+		if s.Mix.Clients > 0 {
+			a.Client = crng.Intn(s.Mix.Clients) + 1
+		}
+		if sampleRate > 0 && srng.Float64() < sampleRate {
+			a.Sample = true
+		}
 		out = append(out, a)
 	}
 	return out
 }
 
+// ---------------------------------------------------------------- histogram
+// Latency methodology: successful (2xx/3xx) request latencies are recorded in a
+// fixed log-bucket histogram, bucket i covering (histBaseMs*r^(i-1), histBaseMs*r^i]
+// with r = histRatio (5%). A percentile is reported as the UPPER bound of the
+// bucket containing it, i.e. a conservative estimate within +5% of the true value.
+// Histograms merge by addition, so any window/run/policy aggregation uses the same
+// method (percentiles are never averaged).
+const (
+	histBaseMs = 0.1
+	histRatio  = 1.05
+	histMaxMs  = 120000.0
+)
+
+var histBuckets = int(math.Ceil(math.Log(histMaxMs/histBaseMs)/math.Log(histRatio))) + 1
+
+func histIndex(ms float64) int {
+	if ms <= histBaseMs {
+		return 0
+	}
+	i := int(math.Ceil(math.Log(ms/histBaseMs) / math.Log(histRatio)))
+	if i >= histBuckets {
+		i = histBuckets - 1
+	}
+	return i
+}
+
 type result struct {
 	sched, lag, done, lat float64
 	status                int
-	failed                bool
+	category              string // "" = success
 	long                  bool
+	backend               string
+	client                int
+	sample                bool
+}
+
+// Window is one export window (completion-time based for completions, schedule-time for offered).
+type Window struct {
+	T0            float64        `json:"t0"`
+	T1            float64        `json:"t1"`
+	Offered       int            `json:"offered"`
+	Sent          int            `json:"sent"`
+	Completed     int            `json:"completed"`
+	OK            int            `json:"ok"`
+	Failed        int            `json:"failed"`
+	Err5xx        int            `json:"err_5xx"`
+	Err4xx        int            `json:"err_4xx"`
+	ErrTimeout    int            `json:"err_timeout"`
+	ErrTransport  int            `json:"err_transport"`
+	LatSumOKMs    float64        `json:"lat_sum_ok_ms"`
+	HistOK        map[string]int `json:"hist_ok"` // sparse: bucket index -> count
+	LongCompleted int            `json:"long_completed"`
 }
 
 type secBucket struct {
@@ -218,6 +295,9 @@ type lbSample struct {
 	T             float64           `json:"t"`
 	Strategy      string            `json:"strategy"`
 	PolicyVersion uint64            `json:"policy_version"`
+	SwitchCount   uint64            `json:"switch_count"`
+	OverheadP50Ms float64           `json:"overhead_p50_ms"`
+	OverheadP95Ms float64           `json:"overhead_p95_ms"`
 	Backends      map[string]lbBack `json:"backends"`
 }
 
@@ -256,6 +336,40 @@ func parseCtrlMap(s string) map[string]string {
 	return m
 }
 
+// parseBackendName extracts "Backend-2" from "Response from Backend-2 (Port 8082) | ...".
+func parseBackendName(body []byte) string {
+	const pre = "Response from "
+	i := bytes.Index(body, []byte(pre))
+	if i < 0 {
+		return ""
+	}
+	rest := body[i+len(pre):]
+	j := bytes.IndexByte(rest, ' ')
+	if j < 0 {
+		return string(rest)
+	}
+	return string(rest[:j])
+}
+
+func syntheticIP(c int) string { return fmt.Sprintf("10.%d.%d.%d", (c>>16)&255, (c>>8)&255, c&255) }
+
+func categorize(status int, err error) string {
+	if err != nil {
+		var ne net.Error
+		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+			return "timeout"
+		}
+		return "transport"
+	}
+	switch {
+	case status >= 500:
+		return "http_5xx"
+	case status >= 400:
+		return "http_4xx"
+	}
+	return ""
+}
+
 func main() {
 	scPath := flag.String("scenario", "", "scenario JSON file (required)")
 	target := flag.String("target", "http://localhost:8080", "load balancer base URL")
@@ -263,9 +377,13 @@ func main() {
 	seed := flag.Int64("seed", 0, "override the scenario seed (0 = use scenario)")
 	scale := flag.Float64("scale", 1, "time compression factor (2 = run twice as fast)")
 	ctrl := flag.String("ctrl", "", "backend control URLs, e.g. Backend-1=http://localhost:9081,Backend-2=...")
+	window := flag.Float64("window", 5, "export window length in seconds")
+	sample := flag.Float64("sample", 0, "fraction of requests to sample into -samples-out (0 = none)")
+	samplesOut := flag.String("samples-out", "", "CSV path for sampled requests")
+	validateOnly := flag.Bool("validate", false, "validate the scenario file and exit")
 	flag.Parse()
 	if *scPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: loadgen -scenario file.json [-target URL] [-out file] [-seed N] [-scale F]")
+		fmt.Fprintln(os.Stderr, "usage: loadgen -scenario file.json [-target URL] [-out file] [-seed N] [-scale F] [-window S] [-sample F -samples-out file]")
 		os.Exit(2)
 	}
 	raw, err := os.ReadFile(*scPath)
@@ -297,10 +415,24 @@ func main() {
 		fmt.Fprintln(os.Stderr, "scenario:", err)
 		os.Exit(1)
 	}
-	res := run(&sc, strings.TrimRight(*target, "/"), parseCtrlMap(*ctrl), raw, *scale)
+	if *sample < 0 || *sample > 1 || *window <= 0 {
+		fmt.Fprintln(os.Stderr, "invalid -sample or -window")
+		os.Exit(2)
+	}
+	if *validateOnly {
+		fmt.Println("ok")
+		return
+	}
+	res, samples := run(&sc, strings.TrimRight(*target, "/"), parseCtrlMap(*ctrl), raw, *scale, *window, *sample)
 	if *out != "" {
 		b, _ := json.MarshalIndent(res, "", " ")
 		if err := os.WriteFile(*out, b, 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+	if *samplesOut != "" {
+		if err := writeSamples(*samplesOut, samples); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -311,8 +443,24 @@ func main() {
 		s["latency_p50_ms"], s["latency_p95_ms"], s["latency_p99_ms"], s["generator_ok"])
 }
 
-func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte, scale float64) map[string]any {
-	sched := buildSchedule(sc)
+func writeSamples(path string, rs []result) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	w := csv.NewWriter(f)
+	_ = w.Write([]string{"sched_s", "latency_ms", "status", "category", "backend", "long"})
+	for _, r := range rs {
+		_ = w.Write([]string{strconv.FormatFloat(r.sched, 'f', 3, 64), strconv.FormatFloat(r.lat*1000, 'f', 3, 64),
+			strconv.Itoa(r.status), r.category, r.backend, strconv.FormatBool(r.long)})
+	}
+	w.Flush()
+	return w.Error()
+}
+
+func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte, scale, windowS, sampleRate float64) (map[string]any, []result) {
+	sched := buildSchedule(sc, sampleRate)
 	total := sc.duration()
 	client := &http.Client{
 		Timeout: time.Duration(sc.TimeoutMs) * time.Millisecond,
@@ -325,6 +473,8 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 	dropped := 0
 	var wg sync.WaitGroup
 	start := time.Now()
+	affinity := map[int]map[string]int{}
+	needBackend := sc.TrackBackend || sampleRate > 0
 
 	// fault scheduler
 	var faults []faultApplied
@@ -359,14 +509,14 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 		}()
 	}
 
-	// load balancer sampler: routing distribution and active policy over time
+	// load balancer sampler: routing distribution, policy, switch count and request-path overhead
 	var lbs []lbSample
 	stopSample := make(chan struct{})
 	var swg sync.WaitGroup
 	swg.Add(1)
 	go func() {
 		defer swg.Done()
-		sc := &http.Client{Timeout: time.Second}
+		hc := &http.Client{Timeout: time.Second}
 		tk := time.NewTicker(time.Second)
 		defer tk.Stop()
 		for {
@@ -375,7 +525,7 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 				return
 			case <-tk.C:
 				s := lbSample{T: time.Since(start).Seconds(), Backends: map[string]lbBack{}}
-				if r, err := sc.Get(target + "/api/status"); err == nil {
+				if r, err := hc.Get(target + "/api/status"); err == nil {
 					var st struct {
 						Active   string `json:"active_strategy"`
 						Backends []struct {
@@ -392,7 +542,7 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 						s.Backends[b.Name] = lbBack{b.Alive, b.Active, b.Total}
 					}
 				}
-				if r, err := sc.Get(target + "/api/policy"); err == nil {
+				if r, err := hc.Get(target + "/api/policy"); err == nil {
 					var p struct {
 						Policy struct {
 							Version uint64 `json:"version"`
@@ -401,6 +551,23 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 					_ = json.NewDecoder(r.Body).Decode(&p)
 					r.Body.Close()
 					s.PolicyVersion = p.Policy.Version
+				}
+				if r, err := hc.Get(target + "/api/metrics"); err == nil {
+					var m struct {
+						Controller struct {
+							SwitchCount uint64 `json:"switch_count"`
+						} `json:"controller"`
+						Global struct {
+							Overhead struct {
+								P50 float64 `json:"p50_ms"`
+								P95 float64 `json:"p95_ms"`
+							} `json:"overhead_duration_stats"`
+						} `json:"global_traffic"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&m)
+					r.Body.Close()
+					s.SwitchCount = m.Controller.SwitchCount
+					s.OverheadP50Ms, s.OverheadP95Ms = m.Global.Overhead.P50, m.Global.Overhead.P95
 				}
 				mu.Lock()
 				lbs = append(lbs, s)
@@ -432,21 +599,39 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 			if a.DelayMs > 0 {
 				url += fmt.Sprintf("?delay=%dms", a.DelayMs)
 			}
-			t1 := time.Now()
-			r := result{sched: a.T, lag: lag, long: a.Long}
-			resp, err := client.Get(url)
+			req, err := http.NewRequest(http.MethodGet, url, nil)
 			if err != nil {
-				r.failed, r.status = true, 0
-			} else {
+				return
+			}
+			if a.Client > 0 {
+				req.Header.Set("X-Forwarded-For", syntheticIP(a.Client))
+			}
+			t1 := time.Now()
+			r := result{sched: a.T, lag: lag, long: a.Long, client: a.Client, sample: a.Sample}
+			resp, err := client.Do(req)
+			if err == nil {
+				if needBackend {
+					buf := make([]byte, 128)
+					n, _ := io.ReadFull(resp.Body, buf)
+					r.backend = parseBackendName(buf[:n])
+				}
 				io.Copy(io.Discard, resp.Body)
 				resp.Body.Close()
 				r.status = resp.StatusCode
-				r.failed = resp.StatusCode >= 500
 			}
+			r.category = categorize(r.status, err)
 			r.lat = time.Since(t1).Seconds()
 			r.done = time.Since(start).Seconds()
 			mu.Lock()
 			results = append(results, r)
+			if a.Client > 0 && r.backend != "" {
+				m := affinity[a.Client]
+				if m == nil {
+					m = map[string]int{}
+					affinity[a.Client] = m
+				}
+				m[r.backend]++
+			}
 			mu.Unlock()
 		}(a, due)
 	}
@@ -456,39 +641,73 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 	swg.Wait()
 	elapsed := time.Since(start).Seconds()
 
-	// aggregate per second
+	// ---- aggregate: per-second buckets (for adaptation analysis) and export windows
 	n := int(math.Ceil(math.Max(total, elapsed)))
 	buckets := make([]secBucket, n+1)
 	lats := make([][]float64, n+1)
 	for i := range buckets {
 		buckets[i].T = i
 	}
+	nw := int(math.Ceil(math.Max(total, elapsed)/windowS)) + 1
+	wins := make([]Window, nw)
+	for i := range wins {
+		wins[i] = Window{T0: float64(i) * windowS, T1: float64(i+1) * windowS, HistOK: map[string]int{}}
+	}
 	for _, a := range sched {
 		buckets[int(a.T)].Offered++
+		wins[int(a.T/windowS)].Offered++
 	}
 	var okLat, allLat, lags []float64
-	errs, sent := 0, len(results)
+	cats := map[string]int{}
+	errs := 0
+	var samples []result
 	for _, r := range results {
 		lags = append(lags, r.lag)
-		si := int(r.sched)
-		if si < len(buckets) {
+		if si := int(r.sched); si < len(buckets) {
 			buckets[si].Sent++
+		}
+		if wi := int(r.sched / windowS); wi < nw {
+			wins[wi].Sent++
 		}
 		di := int(r.done)
 		if di >= len(buckets) {
 			di = len(buckets) - 1
 		}
-		buckets[di].Completed++
-		lats[di] = append(lats[di], r.lat*1000)
-		allLat = append(allLat, r.lat*1000)
-		if r.failed {
-			buckets[di].Errors++
-			errs++
-		} else {
-			okLat = append(okLat, r.lat*1000)
+		wi := int(r.done / windowS)
+		if wi >= nw {
+			wi = nw - 1
 		}
+		buckets[di].Completed++
+		wins[wi].Completed++
+		allLat = append(allLat, r.lat*1000)
 		if r.long {
 			buckets[di].LongCompleted++
+			wins[wi].LongCompleted++
+		}
+		if r.category != "" {
+			errs++
+			cats[r.category]++
+			buckets[di].Errors++
+			wins[wi].Failed++
+			switch r.category {
+			case "http_5xx":
+				wins[wi].Err5xx++
+			case "http_4xx":
+				wins[wi].Err4xx++
+			case "timeout":
+				wins[wi].ErrTimeout++
+			default:
+				wins[wi].ErrTransport++
+			}
+		} else {
+			okLat = append(okLat, r.lat*1000)
+			lats[di] = append(lats[di], r.lat*1000)
+			wins[wi].OK++
+			wins[wi].LatSumOKMs += r.lat * 1000
+			wins[wi].HistOK[strconv.Itoa(histIndex(r.lat*1000))]++
+		}
+		if r.sample {
+			samples = append(samples, r)
 		}
 	}
 	for i := range buckets {
@@ -498,6 +717,7 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 	sort.Float64s(okLat)
 	sort.Float64s(allLat)
 	sort.Float64s(lags)
+	sort.Slice(samples, func(i, j int) bool { return samples[i].sched < samples[j].sched })
 	completed := len(results)
 	lagP99 := pct(lags, .99) * 1000
 	errRate := 0.0
@@ -506,26 +726,54 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 	}
 	var scenarioDoc any
 	_ = json.Unmarshal(rawScenario, &scenarioDoc)
+
+	summary := map[string]any{
+		"duration_s": elapsed, "offered_total": float64(len(sched)), "sent_total": float64(len(results)),
+		"completed_total": float64(completed), "errors_total": float64(errs), "error_rate": errRate,
+		"errors_by_category":   cats,
+		"dropped_by_generator": float64(dropped),
+		"offered_rps_avg":      float64(len(sched)) / total,
+		"completed_rps_avg":    float64(completed) / elapsed,
+		"latency_p50_ms":       pct(allLat, .5), "latency_p95_ms": pct(allLat, .95), "latency_p99_ms": pct(allLat, .99),
+		"latency_ok_p95_ms":   pct(okLat, .95),
+		"schedule_lag_p50_ms": pct(lags, .5) * 1000, "schedule_lag_p99_ms": lagP99, "schedule_lag_max_ms": pct(lags, 1) * 1000,
+		"generator_ok": dropped == 0 && lagP99 < 25,
+	}
+	if sc.Mix.Clients > 0 {
+		total, modal, multi := 0, 0, 0
+		for _, m := range affinity {
+			best, sum := 0, 0
+			for _, c := range m {
+				sum += c
+				if c > best {
+					best = c
+				}
+			}
+			total += sum
+			modal += best
+			if len(m) > 1 {
+				multi++
+			}
+		}
+		stick := 0.0
+		if total > 0 {
+			stick = float64(modal) / float64(total)
+		}
+		summary["affinity"] = map[string]any{"clients_seen": len(affinity), "requests_tracked": total,
+			"stickiness": stick, "clients_served_by_multiple_backends": multi}
+	}
 	return map[string]any{
 		"generator": map[string]any{
 			"go": runtime.Version(), "num_cpu": runtime.NumCPU(), "gomaxprocs": runtime.GOMAXPROCS(0),
-			"started_at": start.UTC().Format(time.RFC3339), "time_scale": scale, "seed": sc.Seed,
-			"arrivals": orDefault(sc.Arrivals, "poisson"), "target": target,
+			"started_at": start.UTC().Format(time.RFC3339Nano), "start_unix": float64(start.UnixNano()) / 1e9,
+			"time_scale": scale, "seed": sc.Seed, "arrivals": orDefault(sc.Arrivals, "poisson"), "target": target,
+			"window_s": windowS, "sample_rate": sampleRate,
 		},
+		"hist":     map[string]any{"base_ms": histBaseMs, "ratio": histRatio, "buckets": histBuckets, "report": "upper bucket bound"},
 		"scenario": scenarioDoc,
-		"summary": map[string]any{
-			"duration_s": elapsed, "offered_total": float64(len(sched)), "sent_total": float64(sent),
-			"completed_total": float64(completed), "errors_total": float64(errs), "error_rate": errRate,
-			"dropped_by_generator": float64(dropped),
-			"offered_rps_avg":      float64(len(sched)) / total,
-			"completed_rps_avg":    float64(completed) / elapsed,
-			"latency_p50_ms":       pct(allLat, .5), "latency_p95_ms": pct(allLat, .95), "latency_p99_ms": pct(allLat, .99),
-			"latency_ok_p95_ms":   pct(okLat, .95),
-			"schedule_lag_p50_ms": pct(lags, .5) * 1000, "schedule_lag_p99_ms": lagP99, "schedule_lag_max_ms": pct(lags, 1) * 1000,
-			"generator_ok": dropped == 0 && lagP99 < 25,
-		},
-		"seconds": buckets, "lb": lbs, "faults_applied": faults,
-	}
+		"summary":  summary,
+		"seconds":  buckets, "windows": wins, "lb": lbs, "faults_applied": faults,
+	}, samples
 }
 
 func orDefault(s, d string) string {

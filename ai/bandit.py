@@ -188,7 +188,9 @@ class LinUCB(Learner):
         ucb = {a: mu[a] + self.alpha * self.model.uncertainty(a, x) for a in allowed}
         choice = _argmax_random_tie(ucb, rng)
         greedy = _argmax_random_tie(mu, rng) if len(allowed) > 1 else choice
-        return Selection(choice, _scores_list(ucb), mu[choice] + 1e-12 < mu[greedy])
+        # exploration = a non-greedy choice OR the first time this action is ever tried
+        explored = bool(mu[choice] + 1e-12 < mu[greedy] or self.model.n[choice] == 0)
+        return Selection(choice, _scores_list(ucb), explored)
 
     def update(self, x, action, reward):
         self.model.update(action, x, reward)

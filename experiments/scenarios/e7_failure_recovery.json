@@ -1,0 +1,37 @@
+{
+ "name": "e7_failure_recovery",
+ "description": "Backend-2 down at t=12 s, restored at t=24 s; 600 rps.",
+ "seed": 1000,
+ "request_path": "/work",
+ "arrivals": "poisson",
+ "phases": [
+  {
+   "type": "fixed",
+   "duration_s": 36,
+   "rps": 600
+  }
+ ],
+ "mix": {
+  "long_fraction": 0.0,
+  "long_delay_ms": 0,
+  "short_delay_ms": 0
+ },
+ "faults": [
+  {
+   "at_s": 12,
+   "backend": "Backend-2",
+   "set": {
+    "down": true
+   }
+  },
+  {
+   "at_s": 24,
+   "backend": "Backend-2",
+   "set": {
+    "down": false
+   }
+  }
+ ],
+ "timeout_ms": 5000,
+ "max_in_flight": 5000
+}

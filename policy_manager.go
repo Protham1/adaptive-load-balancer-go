@@ -67,6 +67,7 @@ type Proposal struct {
 	Strategy          string // wire name
 	Weights           map[string]float64
 	Scores            []*float64
+	Explored          bool // the learner marked this as exploration of an untried/non-greedy action
 	ModelVersion      string
 	Diagnostic        string
 	RequestedAt       time.Time // when the decision request was sent
@@ -190,7 +191,10 @@ func (m *PolicyManager) propose(p Proposal, now time.Time) Result {
 	if now.Sub(m.lastSwitch) < m.cfg.MinPolicyAge {
 		return m.reject(ReasonMinPolicyAge)
 	}
-	if int(action) < len(p.Scores) && int(cur) < len(p.Scores) && p.Scores[action] != nil && p.Scores[cur] != nil {
+	// The margin guards EXPLOITATION (do not switch for a negligible expected gain). First-time
+	// exploration of an untried action has, by construction, no expected gain to demonstrate, so
+	// it is exempt; min policy age, safety lockout, health and validity checks still apply.
+	if !p.Explored && int(action) < len(p.Scores) && int(cur) < len(p.Scores) && p.Scores[action] != nil && p.Scores[cur] != nil {
 		if *p.Scores[action]-*p.Scores[cur] < m.cfg.SwitchMargin {
 			return m.reject(ReasonSwitchMargin)
 		}

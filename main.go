@@ -19,14 +19,9 @@ func main() {
 	log.Println("=== Initializing Phase 1 HTTP Load Balancer ===")
 
 	// 1. Start 3 Dummy Backend HTTP Servers on different ports
-	backendConfigs := []struct {
-		Port   string
-		Name   string
-		Weight int
-	}{
-		{Port: "8081", Name: "Backend-1", Weight: 3},
-		{Port: "8082", Name: "Backend-2", Weight: 2},
-		{Port: "8083", Name: "Backend-3", Weight: 1},
+	backendConfigs, err := backendsFromEnv()
+	if err != nil {
+		log.Fatalf("invalid LB_BACKENDS: %v", err)
 	}
 
 	// LB_NO_DUMMY=1: backends run as separate processes (go run ./cmd/backend), so CPU
@@ -66,10 +61,11 @@ func main() {
 
 	// Phase 5: rule-based adaptive baseline. It runs in shadow mode until the
 	// Adaptive-Weighted-Round-Robin action is selected (POST /api/policy {"action":4}).
-	ruleController := controller.New(controller.DefaultConfig())
+	ruleCfg, ruleInterval := ruleControllerFromEnv()
+	ruleController := controller.New(ruleCfg)
 	serverPool.SetController(ruleController)
 	serverPool.SetAffinityRequired(os.Getenv("LB_AFFINITY_REQUIRED") == "1")
-	go ruleController.Run(context.Background(), 10*time.Second,
+	go ruleController.Run(context.Background(), ruleInterval,
 		func() *metrics.StateRepresentation { return metricsCollector.GetStateRepresentation() },
 		serverPool.PublishAdaptiveWeights)
 
@@ -82,6 +78,13 @@ func main() {
 	if agentCfg.URL != "" {
 		mgr := NewPolicyManager(serverPool, mgrCfg, time.Now())
 		ctl := NewAgentController(serverPool, metricsCollector, mgr, agent.NewClient(agentCfg.URL, agentCfg.RequestTimeout), agentCfg)
+		if path := os.Getenv("LB_DECISION_LOG"); path != "" {
+			if f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+				ctl.SetDecisionLog(f)
+			} else {
+				log.Printf("cannot open LB_DECISION_LOG %q: %v", path, err)
+			}
+		}
 		serverPool.SetAgent(ctl)
 		go ctl.Run(context.Background())
 		log.Printf("AI agent enabled: %s (timeout %v, min policy age %v, shadow=%v)",

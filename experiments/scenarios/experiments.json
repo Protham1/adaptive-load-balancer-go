@@ -1,0 +1,365 @@
+{
+ "version": 1,
+ "window_s": 4,
+ "warmup_s": 8,
+ "base_seed": 1000,
+ "criteria": {
+  "err_max": 0.01,
+  "p95_factor": 2.0,
+  "p95_margin_ms": 20.0,
+  "stable_for_s": 4
+ },
+ "pools": {
+  "hetero": [
+   {
+    "name": "Backend-1",
+    "port": 8081,
+    "conc": 24,
+    "weight": 3,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-2",
+    "port": 8082,
+    "conc": 16,
+    "weight": 2,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-3",
+    "port": 8083,
+    "conc": 8,
+    "weight": 1,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   }
+  ],
+  "balanced": [
+   {
+    "name": "Backend-1",
+    "port": 8081,
+    "conc": 16,
+    "weight": 1,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-2",
+    "port": 8082,
+    "conc": 16,
+    "weight": 1,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-3",
+    "port": 8083,
+    "conc": 16,
+    "weight": 1,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   }
+  ],
+  "hetero_cpu": [
+   {
+    "name": "Backend-1",
+    "port": 8081,
+    "conc": 24,
+    "weight": 3,
+    "gomaxprocs": 2,
+    "cpu_work_us": 1500
+   },
+   {
+    "name": "Backend-2",
+    "port": 8082,
+    "conc": 16,
+    "weight": 2,
+    "gomaxprocs": 2,
+    "cpu_work_us": 1500
+   },
+   {
+    "name": "Backend-3",
+    "port": 8083,
+    "conc": 8,
+    "weight": 1,
+    "gomaxprocs": 2,
+    "cpu_work_us": 1500
+   }
+  ]
+ },
+ "experiments": {
+  "E1": {
+   "title": "Balanced baseline",
+   "question": "Does AI avoid unnecessary overhead or switching?",
+   "scenario": "e1_balanced.json",
+   "pool": "balanced",
+   "duration_s": 36,
+   "policies": [
+    "rr",
+    "lc",
+    "swrr",
+    "rule",
+    "ai"
+   ],
+   "env": {},
+   "change": null
+  },
+  "E2": {
+   "title": "Heterogeneous capacity",
+   "question": "Does adaptation use capacity better than RR?",
+   "scenario": "e2_heterogeneous.json",
+   "pool": "hetero",
+   "duration_s": 36,
+   "policies": [
+    "rr",
+    "lc",
+    "swrr",
+    "rule",
+    "ai"
+   ],
+   "env": {},
+   "change": null
+  },
+  "E3": {
+   "title": "CPU imbalance",
+   "question": "Does the controller reduce overload duration?",
+   "scenario": "e3_cpu_imbalance.json",
+   "pool": "hetero_cpu",
+   "duration_s": 36,
+   "policies": [
+    "rr",
+    "lc",
+    "swrr",
+    "rule",
+    "ai"
+   ],
+   "env": {},
+   "change": {
+    "at_s": 12,
+    "end_s": 36
+   }
+  },
+  "E4": {
+   "title": "Latency imbalance",
+   "question": "Does the chosen policy reduce tail latency?",
+   "scenario": "e4_latency_imbalance.json",
+   "pool": "hetero",
+   "duration_s": 36,
+   "policies": [
+    "rr",
+    "lc",
+    "swrr",
+    "rule",
+    "ai"
+   ],
+   "env": {},
+   "change": {
+    "at_s": 12,
+    "end_s": 36
+   }
+  },
+  "E5": {
+   "title": "Long-running requests",
+   "question": "Does LC or another strategy perform better?",
+   "scenario": "e5_long_requests.json",
+   "pool": "hetero",
+   "duration_s": 36,
+   "policies": [
+    "rr",
+    "lc",
+    "swrr",
+    "rule",
+    "ai"
+   ],
+   "env": {},
+   "change": null
+  },
+  "E6": {
+   "title": "Flash crowd",
+   "question": "How quickly does the system adapt?",
+   "scenario": "e6_flash_crowd.json",
+   "pool": "hetero",
+   "duration_s": 36,
+   "policies": [
+    "rr",
+    "lc",
+    "swrr",
+    "rule",
+    "ai"
+   ],
+   "env": {},
+   "change": {
+    "at_s": 10,
+    "end_s": 28
+   }
+  },
+  "E7": {
+   "title": "Failure / recovery",
+   "question": "What are detection and recovery times?",
+   "scenario": "e7_failure_recovery.json",
+   "pool": "hetero",
+   "duration_s": 36,
+   "policies": [
+    "rr",
+    "lc",
+    "swrr",
+    "rule",
+    "ai"
+   ],
+   "env": {},
+   "change": {
+    "at_s": 12,
+    "end_s": 24,
+    "failure_backend": "Backend-2",
+    "restore_at_s": 24
+   }
+  },
+  "E8": {
+   "title": "Mixed workload",
+   "question": "Does learned selection generalize?",
+   "scenario": "e8_mixed.json",
+   "pool": "hetero_cpu",
+   "duration_s": 44.0,
+   "policies": [
+    "rr",
+    "lc",
+    "swrr",
+    "rule",
+    "ai"
+   ],
+   "env": {},
+   "change": {
+    "at_s": 14,
+    "end_s": 44
+   }
+  },
+  "E9": {
+   "title": "Control-interval sweep",
+   "question": "Tradeoff between responsiveness and instability?",
+   "scenario": "e9_mixed_long.json",
+   "pool": "hetero_cpu",
+   "duration_s": 77.0,
+   "policies": [
+    "swrr",
+    "ai"
+   ],
+   "env": {},
+   "change": {
+    "at_s": 24.5,
+    "end_s": 77
+   },
+   "intervals_s": [
+    1,
+    5,
+    10,
+    30,
+    60
+   ]
+  },
+  "E10": {
+   "title": "Ablation",
+   "question": "Which components contribute?",
+   "scenario": "e8_mixed.json",
+   "pool": "hetero_cpu",
+   "duration_s": 44.0,
+   "policies": [],
+   "env": {},
+   "change": {
+    "at_s": 14,
+    "end_s": 44
+   },
+   "arms": [
+    "ai_full",
+    "ai_no_hysteresis",
+    "ai_no_safety",
+    "ai_no_context",
+    "ai_no_ema",
+    "rule_full",
+    "rule_no_ema",
+    "rule_no_deadband"
+   ]
+  },
+  "A1": {
+   "title": "Affinity workload (Consistent Hash)",
+   "question": "Is session affinity preserved, and at what cost?",
+   "scenario": "a1_affinity.json",
+   "pool": "balanced",
+   "duration_s": 36,
+   "policies": [
+    "rr",
+    "lc",
+    "swrr",
+    "ch",
+    "rule",
+    "ai"
+   ],
+   "env": {},
+   "change": null,
+   "affinity": true
+  }
+ },
+ "policies": {
+  "rr": "Round Robin (action 0)",
+  "lc": "Least Connections (action 1)",
+  "swrr": "Static Smooth Weighted Round Robin (action 2, declared capacity weights)",
+  "ch": "Consistent Hash (action 3; affinity workload only)",
+  "rule": "Rule-based adaptive controller (action 4)",
+  "ai": "AI contextual bandit (LinUCB) with the Phase 11-12 policy manager and safety layer"
+ },
+ "ai_defaults": {
+  "algo": "linucb",
+  "alpha": 0.05,
+  "context": "compact",
+  "settle_s": 2,
+  "measure_s": 4,
+  "min_policy_age_s": 6,
+  "safety_cooldown_s": 12,
+  "step_s": 1
+ },
+ "ablation_arms": {
+  "ai_full": {
+   "policy": "ai"
+  },
+  "ai_no_hysteresis": {
+   "policy": "ai",
+   "env": {
+    "LB_AGENT_MIN_POLICY_AGE_S": "0",
+    "LB_AGENT_SWITCH_MARGIN": "0"
+   }
+  },
+  "ai_no_safety": {
+   "policy": "ai",
+   "env": {
+    "LB_AGENT_MAX_ERROR_RATE": "2",
+    "LB_AGENT_MAX_P99_MS": "1000000000"
+   }
+  },
+  "ai_no_context": {
+   "policy": "ai",
+   "agent_algo": "mean-eps-greedy"
+  },
+  "ai_no_ema": {
+   "policy": "ai",
+   "env": {
+    "LB_CONTROLLER_EMA_ALPHA": "1"
+   }
+  },
+  "rule_full": {
+   "policy": "rule"
+  },
+  "rule_no_ema": {
+   "policy": "rule",
+   "env": {
+    "LB_CONTROLLER_EMA_ALPHA": "1"
+   }
+  },
+  "rule_no_deadband": {
+   "policy": "rule",
+   "env": {
+    "LB_CONTROLLER_DEADBAND": "0"
+   }
+  }
+ }
+}

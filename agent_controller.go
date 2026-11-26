@@ -5,8 +5,10 @@ import (
 	"adaptive-load/metrics"
 	"adaptive-load/policy"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -129,6 +131,7 @@ type AgentController struct {
 	decider agent.Decider
 	cfg     AgentConfig
 	clock   func() time.Time // injectable for deterministic tests
+	logFile io.Writer        // optional JSONL decision log (LB_DECISION_LOG)
 
 	mu          sync.Mutex
 	seq         uint64
@@ -143,6 +146,13 @@ type AgentController struct {
 func NewAgentController(pool *ServerPool, tel Telemetry, mgr *PolicyManager, d agent.Decider, cfg AgentConfig) *AgentController {
 	return &AgentController{pool: pool, tel: tel, mgr: mgr, decider: d, cfg: cfg, clock: time.Now,
 		stats: AgentStats{Failures: map[string]uint64{}}}
+}
+
+// SetDecisionLog directs every decision record to w as JSON lines.
+func (a *AgentController) SetDecisionLog(w io.Writer) {
+	a.mu.Lock()
+	a.logFile = w
+	a.mu.Unlock()
 }
 
 // Run steps until ctx is cancelled.
@@ -335,9 +345,25 @@ func featuresFromState(st *metrics.StateRepresentation) agent.Features {
 	return f
 }
 
+// decisionLogLine is the persisted form of a decision (LB_DECISION_LOG, JSONL).
+type decisionLogLine struct {
+	DecisionRecord
+	StateVersion int    `json:"state_version"`
+	Mode         string `json:"mode"` // "live" | "shadow"
+}
+
 func (a *AgentController) record(r DecisionRecord) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.logFile != nil {
+		mode := "live"
+		if a.mgr.cfg.Shadow {
+			mode = "shadow"
+		}
+		if b, err := json.Marshal(decisionLogLine{r, agent.StateVersion, mode}); err == nil {
+			_, _ = a.logFile.Write(append(b, byte(10)))
+		}
+	}
 	a.records = append(a.records, r)
 	if len(a.records) > 50 {
 		a.records = append([]DecisionRecord(nil), a.records[len(a.records)-50:]...)
@@ -409,7 +435,7 @@ func (a *AgentController) decide(ctx context.Context, snap *metrics.MetricsSnaps
 	a.mu.Unlock()
 
 	res := a.mgr.Propose(Proposal{
-		DecisionID: id, Strategy: resp.Strategy, Weights: resp.Weights, Scores: resp.Scores,
+		DecisionID: id, Strategy: resp.Strategy, Weights: resp.Weights, Scores: resp.Scores, Explored: resp.Explored,
 		ModelVersion: resp.ModelVersion, Diagnostic: resp.Diagnostic, RequestedAt: sent, AllowedStrategies: allowed,
 	}, a.clock())
 	log.Printf("[Agent] decision %s latency=%.1fms proposed=%s (%s, model %s) -> %s",
