@@ -1,0 +1,116 @@
+{
+ "run_id": "E3_rule_r0",
+ "experiment": "E3",
+ "arm": "rule",
+ "repetition": 0,
+ "seed": 1000,
+ "date_utc": "2026-11-26T10:02:57.719731+00:00",
+ "git": {
+  "commit": "e13c34256ffb9a960fa25b59d366d3abd51dca8b",
+  "branch": "AI-Agent",
+  "dirty": false,
+  "dirty_files": []
+ },
+ "hardware": {
+  "cpu": "Intel64 Family 6 Model 186 Stepping 3, GenuineIntel",
+  "logical_cores": 12,
+  "physical_cores": 10,
+  "ram_gb": 15.7,
+  "os": "Windows-11-10.0.26200-SP0",
+  "machine": "AMD64"
+ },
+ "versions": {
+  "go": "go version go1.27.1 windows/amd64",
+  "python": "3.13.3",
+  "numpy": "2.2.5"
+ },
+ "scenario": {
+  "file": "scenarios/e3_cpu_imbalance.json",
+  "name": "e3_cpu_imbalance",
+  "sha256": "4143ca8f56b4dea8dca9aadd5a01d9b8267f55a5084230619acea5fdfe186c55",
+  "definition": {
+   "name": "e3_cpu_imbalance",
+   "description": "CPU-bound backends; sustained CPU burner (2 threads, 90% duty) inside Backend-1 from t=12 s.",
+   "seed": 1000,
+   "request_path": "/work",
+   "arrivals": "poisson",
+   "phases": [
+    {
+     "type": "fixed",
+     "duration_s": 36,
+     "rps": 600
+    }
+   ],
+   "mix": {
+    "long_fraction": 0.0,
+    "long_delay_ms": 0,
+    "short_delay_ms": 0
+   },
+   "faults": [
+    {
+     "at_s": 12,
+     "backend": "Backend-1",
+     "set": {
+      "cpu_burn": 0.9,
+      "cpu_threads": 2
+     }
+    }
+   ],
+   "timeout_ms": 5000,
+   "max_in_flight": 5000
+  }
+ },
+ "config": {
+  "policy": "rule",
+  "agent": null,
+  "interval_s": null,
+  "pool_name": "hetero_cpu",
+  "pool": [
+   {
+    "name": "Backend-1",
+    "port": 8081,
+    "conc": 24,
+    "weight": 3,
+    "gomaxprocs": 2,
+    "cpu_work_us": 1500
+   },
+   {
+    "name": "Backend-2",
+    "port": 8082,
+    "conc": 16,
+    "weight": 2,
+    "gomaxprocs": 2,
+    "cpu_work_us": 1500
+   },
+   {
+    "name": "Backend-3",
+    "port": 8083,
+    "conc": 8,
+    "weight": 1,
+    "gomaxprocs": 2,
+    "cpu_work_us": 1500
+   }
+  ],
+  "lb_env": {
+   "LB_BACKENDS": "Backend-1:8081:3,Backend-2:8082:2,Backend-3:8083:1",
+   "LB_NO_DUMMY": "1",
+   "LB_HEALTH_INTERVAL_MS": "1000",
+   "LB_QUIET": "1",
+   "LB_SAFE_ACTION": "2",
+   "LB_CONTROLLER_INTERVAL_S": "3"
+  },
+  "window_s": 4,
+  "warmup_s": 8,
+  "sample_rate": 0.01,
+  "ai_defaults": null
+ },
+ "wall_clock_s": 37.7,
+ "status": {
+  "ok": true,
+  "loadgen_stdout": "e3_cpu_imbalance: offered=21619 completed=21619 errors=0 error_rate=0.0000 p50=22.4ms p95=49.9ms p99=81.8ms generator_ok=true",
+  "final_strategy": "Adaptive-Weighted-Round-Robin",
+  "final_policy_reason": "action",
+  "decisions": 0,
+  "generator_ok": true
+ }
+}

@@ -893,7 +893,309 @@ Raw outputs (per-second offered/completed/errors/percentiles, LB routing samples
 
 ---
 
-## 16. Architectural Summary & Best Practices
+## 16. Phase 14 — Experiment Runner and Data Pipeline
+
+### 16.1 Layout
+```text
+experiments/
+  generator/build_scenarios.py   builds every scenario file + experiments.json (the matrix) deterministically
+  scenarios/                     e1_balanced.json … e9_mixed_long.json, a1_affinity.json, experiments.json
+  runner/
+    stack.py                     process-isolated stack (3 backend processes, LB, optional Python agent) + 1 Hz CPU/RAM sampler
+    run.py                       ONE run: start/stop, select policy mode, run workload, collect, write raw records + metadata
+    matrix.py                    randomized, round-based scheduler; resumable (`done.json`)
+    metadata.py                  commit, hardware, Go/Python versions
+  analysis/
+    hist.py windows.py metrics.py stats.py report.py
+  results/<experiment>/<run_id>/ raw outputs of every run
+  tests/                         27 tests (statistics, histogram, metrics on hand-computed data, matrix/scheduler)
+cmd/loadgen                      the workload generator (Go, separate process); cmd/backend: fault-injectable backends
+```
+**Reproducibility.** A run is determined by *(scenario file, run seed = 1000 + repetition, Git commit, hardware)*. `run_metadata.json` records all of them plus the scenario's SHA-256 and full definition, every environment variable given to the LB, the backend pool, the AI configuration, Go/Python/NumPy versions, and whether the working tree was dirty (the matrix was started from a clean, committed tree). Re-running `python -m experiments.runner.matrix --experiments E4 --reps 3` at the recorded commit regenerates the same arrival schedules (Poisson arrivals are seeded; the injected-error pattern of a backend is seeded too).
+
+### 16.2 What a run does
+1. start 3 backend processes (own ports, own `GOMAXPROCS` / CPU work as defined by the pool) and, for AI arms, the Python decision service (fresh, untrained model);
+2. start the LB with identical settings for every policy (`LB_HEALTH_INTERVAL_MS=1000`, `LB_QUIET=1`, …);
+3. **select the policy mode** (baselines: `POST /api/policy {"action":N}` and verify the active strategy; AI: the Go agent loop runs from the known-safe baseline);
+4. run the seeded workload with the load generator in its own process; the **first 8 s of every scenario are warm-up** (identical for all policies) and are excluded from every metric;
+5. collect, stop everything, derive the window metrics, merge the decision logs, write metadata and `done.json` last (a crashed run leaves `failed.json` with the traceback and is reported, never silently averaged).
+
+### 16.3 Output files (per run, ~100 KB)
+| File | Content |
+| :--- | :--- |
+| `run_metadata.json` | commit (+dirty flag), hardware, Go/Python versions, configuration, seed, date, scenario (file, hash, definition), run status |
+| `window_metrics.csv` | one row per 4 s window: offered/sent/completed/ok/failed, error categories (5xx, 4xx, timeout, transport), throughput, mean / p50 / p95 / p99 latency (from merged histograms), active strategy, policy version, switch count, request-path overhead, **per-backend load and alive fraction**, LB / backends / agent CPU and RAM |
+| `decisions.jsonl` | AI arms: one line per Go-side decision: state version, decision ID, learner action and scores, exploration flag, model version, **policy accepted or rejected with the reason code**, agent latency/failure, and the **reward components** (throughput/latency/error/imbalance contributions, normalized and raw inputs, override) of the evaluated window |
+| `request_samples.csv` | seeded 1 % sample of requests: schedule time, latency, status, failure category, responding backend, long/short — no bodies, no client identity |
+| `loadgen.json` | raw generator export: per-second buckets, per-window histograms, per-second LB routing/policy samples, applied faults, scenario echo |
+| `resources.csv` | per-process CPU % (of one core) and RSS at 1 Hz, plus system-wide CPU (to flag disturbed runs) |
+| `agent_status.json` | Go-side agent counters (requests, failures by kind, latency avg/max, safety events, reason counts) |
+
+**Privacy and size.** Full requests are never stored. Only a 1 % sample is kept, with synthetic client addresses in the generator (never recorded). Latency is exported as a **fixed log-bucket histogram** (bucket ratio 1.05) instead of raw values.
+
+### 16.4 Generator extensions made for this phase (`cmd/loadgen`)
+Windowed histograms and failure categories; seeded sampling and synthetic-client affinity tracking that never perturb the arrival schedule (tested); per-second sampling of the LB's switch counter and request-path overhead; `-validate` for scenario files. The LB gained `LB_BACKENDS` (declared weights), `LB_CONTROLLER_INTERVAL_S` / `_EMA_ALPHA` / `_DEADBAND` (ablations), `LB_QUIET` and `LB_DECISION_LOG`.
+
+### 16.5 A defect found by the pilot (and fixed before the matrix)
+The first pilot run of the AI arm never left the static-SWRR baseline. A freshly initialised bandit gives every action the same score, so the Phase 12 *switch margin* (required expected gain ≥ 0.02) rejected every proposal; a rejected proposal gets no evaluation window, so the learner could never learn — a deadlock between hysteresis and exploration. Fix: the learner marks first-time exploration (`explored`), and the policy manager exempts it from the **margin only** (minimum policy age, safety lockout, health and validity checks still apply); regression test `TestSwitchMarginDoesNotBlockFirstTimeExploration`. All reported AI results use the fixed version.
+
+---
+
+## 17. Phase 15 — Experimental Matrix
+
+Pools: **hetero** = 3 backends, declared weights 3:2:1, capacity ≈ 1180 / 790 / 390 rps (concurrency 24/16/8 × 20 ms); **balanced** = 3 equal backends (16 slots each); **hetero_cpu** = hetero with 2 OS threads per backend and 1.5 ms of real CPU work per request, so that an in-process CPU burner actually slows request handling. Every scenario is 36 s except E8 (44 s) and E9 (77 s); load is Poisson.
+
+| ID | Setup (scenario file) | Primary question | Policies |
+| :--- | :--- | :--- | :--- |
+| **E1** Balanced | equal backends, 300 rps, short requests (`e1_balanced`) | Does AI avoid unnecessary overhead or switching? | RR, LC, SWRR, rule, AI |
+| **E2** Heterogeneous | 3:2:1 pool, 1300 rps (`e2_heterogeneous`) | Does adaptation use capacity better than RR? | same |
+| **E3** CPU imbalance | CPU-bound pool, burner (2 threads, 90 %) in Backend-1 from t=12 s (`e3_cpu_imbalance`) | Does the controller reduce overload duration? | same |
+| **E4** Latency imbalance | Backend-2 +150 ms from t=12 s (`e4_latency_imbalance`) | Does the chosen policy reduce tail latency? | same |
+| **E5** Long-running | 20 % of requests hold a slot 400 ms, 400 rps (`e5_long_requests`) | Does LC or another strategy perform better? | same |
+| **E6** Flash crowd | 200 → 1400 rps over 8 s, hold 10 s, ramp down (`e6_flash_crowd`) | How quickly does the system adapt? | same |
+| **E7** Failure/recovery | Backend-2 down t=12 s, restored t=24 s (`e7_failure_recovery`) | Detection and recovery times? | same |
+| **E8** Mixed | ramp 400→800 rps + 10 % long requests + CPU burner + added latency + failure/recovery (`e8_mixed`) | Does learned selection generalize? | same |
+| **E9** Interval sweep | E8 stretched ×1.75 (77 s) (`e9_mixed_long`) | Responsiveness vs instability? | SWRR; AI with total control interval 1, 5, 10, 30, 60 s |
+| **E10** Ablation | E8 | Which components contribute? | AI full / without hysteresis / without safety / without context / without EMA; rule full / without EMA / without deadband |
+| **A1** Affinity | equal backends, 400 rps from 200 synthetic clients (`a1_affinity`) | Is session affinity preserved, and at what cost? | RR, LC, SWRR, **CH**, rule, AI |
+
+* **Consistent Hash only on the affinity workload (A1)**, started with `LB_AFFINITY_REQUIRED=1`; elsewhere it is masked, as in Phase 6.
+* **Ablations.** *No hysteresis*: minimum policy age 0 and switch margin 0. *No safety*: error/p99 thresholds raised out of reach. *No context*: the non-contextual mean ε-greedy bandit replaces LinUCB (same loop, same safety, no state features). *No EMA* / *no deadband*: the **Phase 5 rule-based controller's** EMA (α=1) or hysteresis deadband (0) are disabled; they affect the AI only through the rule-based action. State v1 itself uses the window's raw values, so there is no EMA inside the learner's features to ablate.
+* **E9 intervals.** Interval *I* = settle *I*/3 + measure 2*I*/3, minimum policy age *I*. The LB's metrics window is 10 s, so for *I* < 10 s the reward's p95 is not attributable to the last policy; that is exactly the tradeoff E9 probes.
+* **Adaptation criterion (pre-defined, §19.2)** and the **change point** of each experiment are in `experiments.json`.
+
+---
+
+## 18. Phase 16 — Baselines and Fair Comparison
+
+Compared on the same workloads, hardware, warm-up, request mix, offered load and duration: **Round Robin, Least Connections, static SWRR, Consistent Hash (affinity workload only), the rule-based adaptive controller, and the AI contextual-bandit controller.**
+
+### 18.1 Design controls
+| Control | Implementation |
+| :--- | :--- |
+| Identical conditions | same pool, health-check interval (1 s), LB build, scenario file, warm-up and duration for every policy |
+| Paired design | repetition *r* uses seed 1000+*r* for **every** policy ⇒ identical arrival schedule, long/short mix and injected-error pattern across policies |
+| Order randomization | runs are executed in **rounds**: round *r* contains every (experiment, condition) once in a seeded random order, so all conditions are spread over the same time period (tests assert balance and determinism) |
+| Repetitions | `--reps N`; the plan's *minimum exploratory target is 5*; the pass reported here uses **3** (see §19.5) and the runner resumes to add repetitions without redoing finished runs |
+| Failed / unhealthy runs | never averaged: failures are listed; runs where the generator was the bottleneck (dropped sends or schedule lag p99 ≥ 25 ms) are excluded and counted; runs with system CPU > 90 % at any second are flagged |
+| No capacity deprivation | static SWRR and the rule-based controller start from the **declared capacity weights** (3:2:1 in `hetero`); LC uses live connection counts; RR is capacity-blind by definition. Backends are identical processes in every arm |
+
+### 18.2 The AI arm: documented exploration policy and handicaps
+* Learner: **LinUCB**, per-action ridge regression (λ = 1) on the **compact** 15-dimensional context (4 global + 10 backend aggregates + bias), exploration bonus **α = 0.05** (the value tuned on the Phase 9 development seeds; not re-tuned on these scenarios). No ε-random exploration; an action never tried before is chosen by the UCB bonus and marked `explored`.
+* The model is **untrained at the start of every run** (cold start; nothing is carried between runs or repetitions). With 6 s decisions the AI gets about 5 decisions per 36 s run, so this is a *cold-start-cost* measurement, not a measurement of a converged policy. A pre-trained arm is future work.
+* The Phase 11-12 safety layer is **part of the system under test**: starts on static SWRR; minimum policy age 6 s; switch margin 0.02 (exploitation only); settle 2 s + measure 4 s; fallback to static SWRR when the window error fraction ≥ 0.10 or p99 ≥ 2000 ms, with a 12 s AI lockout.
+* The AI arm additionally runs the Python decision service and the Go agent loop; their cost is measured, not hidden (§19.4–19.5). Baselines run without the agent loop.
+
+---
+
+## 19. Phase 17 — Metrics and Statistical Analysis
+
+Implementation: `experiments/analysis/` (`metrics.py` per-run metrics, `stats.py` statistics, `report.py` aggregation and report). Everything below is computed over the **measurement period** = windows from the end of the 8 s warm-up to the end of the scenario.
+
+### 19.1 Metric definitions
+| Metric | Definition |
+| :--- | :--- |
+| Throughput | **successful** (non-error) completed requests per second; **offered RPS** and total completed RPS are reported beside it (they differ under saturation) |
+| Latency | p50 / p95 / p99 / mean of **successful** requests. Percentiles come from the **merged** fixed log-bucket histogram (one methodology for every window, run and policy; reported as the bucket's upper bound, i.e. conservative by at most +5 %); percentiles are never averaged. Failures are not in the distribution; they are in the error rate |
+| Error rate | failed ÷ completed requests; a failure is an HTTP 5xx or 4xx, a client timeout (5 s), or a transport error. Reported by category |
+| Resource usage | CPU % (of one core) and RSS of the **LB**, the **backends** (summed) and the **AI process**, separately (`psutil`, 1 Hz) |
+| Utilization imbalance | coefficient of variation (and Jain's index) of the **capacity-adjusted service rate** `x_i = (requests_i / s) / declared_weight_i` over backends alive in ≥ 90 % of samples. Raw request counts are *not* used: equal counts on a 3:2:1 pool read as "fair" but are not (hand-computed test: equal counts ⇒ J = 0.823) |
+| Adaptation time | time from the injected change to the start of **stable acceptable behaviour** (§19.2); censored if not stable at the end of the change |
+| Overload duration | seconds after the change where the acceptance criterion is violated |
+| Detection / recovery time | E7: fault → LB marks the backend down (`detect_s`); restore → marked up (`reentry_alive_s`) and → its traffic share is back to ≥ 80 % of its capacity share for 2 samples (`reentry_share_s`) |
+| Switch frequency | strategy changes per minute (LB switch counter) and time share per strategy |
+| Controller overhead | AI decision latency (avg/max), communication failures, safety fallbacks, AI-process CPU/RAM, LB CPU/RAM per policy, and the request-path overhead measured inside the LB; micro-benchmark of strategy selection in §19.4 |
+
+### 19.2 Pre-defined adaptation criterion
+Per 1-second bucket after the change, behaviour is *acceptable* iff error fraction ≤ **1 %** and p95 ≤ **max(2 × reference, reference + 20 ms)**, where the reference is the run's own median per-second p95 between warm-up and the change. Adaptation time = (last violating second + 1) − change time; it is **censored** (excluded, and counted) if behaviour was not acceptable for at least 4 s before the change ended. These constants are fixed in `experiments.json` before any result was seen.
+
+### 19.3 Statistics and claim rule
+* Every cell: **mean ± sample SD [95 % percentile-bootstrap CI of the mean]** over repetitions (10 000 resamples, seeded).
+* Policies are compared **paired by repetition** (identical seeds): mean difference with a paired bootstrap CI and an **exact sign-flip randomisation test** (no normality assumption; cross-checked against SciPy's `permutation_test` in the tests). Several candidates against one reference use **Holm's correction** (untestable comparisons do not count; a unit test caught an early version that did).
+* With *n* pairs the smallest attainable two-sided p is 2/2ⁿ: **p < 0.05 is impossible for n < 6**. The report therefore never calls a difference *better*/*worse* unless **n ≥ 5, the paired CI excludes 0 and Holm p < 0.05**; otherwise it prints *inconclusive*, or *insufficient_n* when n < 5. No single-run claims, no cherry-picked plots: all plots show every condition with CIs.
+
+### 19.4 Request-path overhead
+* **In-LB metric.** The Phase 2 `overhead_duration` (request start → proxy start) rounds to **0.000 ms** (sub-microsecond): it is recorded for every run but is not informative at this resolution.
+* **Strategy selection micro-benchmark** (`go test -bench Strategy ./strategy`, 3 backends, 12 parallel goroutines, 3 repetitions; `results/analysis/strategy_bench.txt`): Round Robin **31 ns**, Least Connections **133–279 ns**, Consistent Hash **362–392 ns**, Smooth WRR **551–563 ns** per selection, ≤ 4 allocations. Against ≈ 20 ms request latency this is below 0.003 %. The AI adds **no work to the request path**: the handler loads one atomic pointer; decisions happen once per control interval in a separate goroutine.
+* **End-to-end cost** is measured per run (table below): LB CPU is the same with and without the agent loop to within run-to-run variation.
+
+### 19.5 Results (second pass: 180 runs, all valid)
+**Data quality.** 180 / 180 runs complete and valid; generator schedule-lag p99 ≤ 3.9 ms and 0 dropped sends in every run; every run's metadata names commit `e13c342` with a clean tree; 3 repetitions per condition (seeds 1000–1002). Raw data, per-run metrics, the comparison table and plots are in `experiments/results/` (`analysis/report.md`, `summary.csv`, `comparisons.csv`, `run_metrics.csv`, `plots/`).
+
+> **n = 3 per condition (below the plan's minimum of 5).** With 3 pairs the smallest attainable two-sided p is 0.25, so the analysis labels *every* paired comparison `insufficient_n`. **The tables below are descriptive; none of the differences is a statistically supported claim.** `python -m experiments.runner.matrix --reps 5 …` resumes and adds repetitions 3–4 to every condition; at least 6 pairs are needed before p < 0.05 is attainable.
+
+**E1 Balanced** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | errors | OK rps |
+|---|---:|---:|---:|
+| rr | 23.3 ± 1.3 | 0.0000 ± 0.0000 | 300 ± 3 |
+| lc | 22.9 ± 0.6 | 0.0000 ± 0.0000 | 300 ± 3 |
+| swrr | 22.5 ± 0.0 | 0.0000 ± 0.0000 | 300 ± 3 |
+| rule | 22.5 ± 0.0 | 0.0000 ± 0.0000 | 300 ± 3 |
+| ai | 23.2 ± 0.6 | 0.0000 ± 0.0000 | 300 ± 3 |
+
+**E2 Heterogeneous capacity (1300 rps)** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | p99 (ms) | errors | OK rps | imbalance CV |
+|---|---:|---:|---:|---:|---:|
+| rr | 536.2 ± 0.0 | 536.2 ± 0.0 | 0.0357 ± 0.0020 | 1253 ± 9 | 0.464 ± 0.000 |
+| lc | 35.5 ± 2.0 | 42.5 ± 4.1 | 0.0000 ± 0.0000 | 1299 ± 6 | 0.357 ± 0.012 |
+| swrr | 22.9 ± 0.6 | 23.6 ± 0.0 | 0.0000 ± 0.0000 | 1299 ± 6 | 0.000 ± 0.000 |
+| rule | 23.6 ± 1.2 | 25.7 ± 1.9 | 0.0000 ± 0.0000 | 1299 ± 6 | 0.001 ± 0.000 |
+| ai | 23.2 ± 0.6 | 25.7 ± 2.7 | 0.0000 ± 0.0000 | 1299 ± 6 | 0.001 ± 0.001 |
+
+**E3 CPU imbalance** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | p99 (ms) | errors | overload (s) | imbalance CV |
+|---|---:|---:|---:|---:|---:|
+| rr | 52.8 ± 17.0 | 85 ± 35 | 0.0000 ± 0.0000 | 14.0 ± 12.3 | 0.464 ± 0.000 |
+| lc | 35.5 ± 2.7 | 46 ± 3 | 0.0000 ± 0.0000 | 0.0 ± 0.0 | 0.518 ± 0.008 |
+| swrr | 327.6 ± 403.0 | 1084 ± 1623 | 0.0067 ± 0.0116 | 24.0 ± 0.0 | 0.010 ± 0.017 |
+| rule | 269.9 ± 263.1 | 644 ± 695 | 0.0002 ± 0.0003 | 20.7 ± 5.8 | 0.075 ± 0.070 |
+| ai | 285.2 ± 158.7 | 547 ± 221 | 0.0001 ± 0.0001 | 18.0 ± 10.4 | 0.168 ± 0.188 |
+
+**E4 Latency imbalance** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | errors | OK rps | overload (s) | imbalance CV |
+|---|---:|---:|---:|---:|---:|
+| rr | 684.3 ± 0.0 | 0.1473 ± 0.0020 | 509 ± 3 | 24.0 ± 0.0 | 0.464 ± 0.000 |
+| lc | 174.6 ± 0.0 | 0.0000 ± 0.0000 | 601 ± 5 | 24.0 ± 0.0 | 0.764 ± 0.000 |
+| swrr | 684.3 ± 0.0 | 0.1472 ± 0.0021 | 509 ± 3 | 24.0 ± 0.0 | 0.000 ± 0.000 |
+| rule | 673.5 ± 18.8 | 0.0652 ± 0.0014 | 560 ± 4 | 24.0 ± 0.0 | 0.176 ± 0.002 |
+| ai | 684.3 ± 0.0 | 0.1151 ± 0.0416 | 528 ± 20 | 24.0 ± 0.0 | 0.165 ± 0.232 |
+
+**E5 Long-running requests** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | p99 (ms) | errors | OK rps |
+|---|---:|---:|---:|---:|
+| rr | 563.4 ± 27.5 | 948 ± 26 | 0.1345 ± 0.0034 | 346 ± 4 |
+| lc | 463.2 ± 0.0 | 611 ± 17 | 0.0000 ± 0.0001 | 400 ± 4 |
+| swrr | 448.5 ± 12.7 | 563 ± 27 | 0.0000 ± 0.0000 | 400 ± 4 |
+| rule | 448.5 ± 12.7 | 555 ± 32 | 0.0000 ± 0.0000 | 400 ± 4 |
+| ai | 527.7 ± 14.7 | 903 ± 25 | 0.0377 ± 0.0052 | 384 ± 6 |
+
+**E6 Flash crowd** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | errors | OK rps | overload (s) |
+|---|---:|---:|---:|---:|
+| rr | 536.2 ± 0.0 | 0.0294 ± 0.0027 | 945 ± 9 | 11.3 ± 0.6 |
+| lc | 32.2 ± 0.9 | 0.0000 ± 0.0000 | 974 ± 7 | 0.0 ± 0.0 |
+| swrr | 22.9 ± 0.6 | 0.0000 ± 0.0000 | 974 ± 7 | 0.0 ± 0.0 |
+| rule | 23.6 ± 1.2 | 0.0000 ± 0.0000 | 974 ± 7 | 0.0 ± 0.0 |
+| ai | 23.2 ± 0.6 | 0.0000 ± 0.0000 | 974 ± 7 | 0.0 ± 0.0 |
+
+**E7 Failure / recovery** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | errors | detect (s) | marked up (s) | share back (s) | overload (s) |
+|---|---:|---:|---:|---:|---:|---:|
+| rr | 356.2 ± 149.5 | 0.0015 ± 0.0026 | 1.00 ± 0.00 | 1.00 ± 0.00 | 3.00 ± 0.00 | 11.7 ± 0.6 |
+| lc | 23.6 ± 0.0 | 0.0001 ± 0.0000 | 1.00 ± 0.00 | 1.00 ± 0.00 | 3.00 ± 0.00 | 0.0 ± 0.0 |
+| swrr | 22.9 ± 0.6 | 0.0001 ± 0.0000 | 1.00 ± 0.00 | 1.00 ± 0.00 | 3.00 ± 0.00 | 0.0 ± 0.0 |
+| rule | 22.9 ± 0.6 | 0.0001 ± 0.0000 | 1.00 ± 0.00 | 1.00 ± 0.00 | 4.00 ± 0.00 | 0.7 ± 1.2 |
+| ai | 23.2 ± 0.6 | 0.0001 ± 0.0000 | 1.00 ± 0.00 | 1.00 ± 0.00 | 3.67 ± 0.58 | 0.0 ± 0.0 |
+
+**E8 Mixed workload** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | p99 (ms) | errors | OK rps | overload (s) |
+|---|---:|---:|---:|---:|---:|
+| rr | 748 ± 114 | 910 ± 236 | 0.314 ± 0.017 | 484 ± 17 | 27.3 ± 1.5 |
+| lc | 757 ± 74 | 1048 ± 109 | 0.271 ± 0.017 | 511 ± 12 | 24.0 ± 0.0 |
+| swrr | 996 ± 57 | 2141 ± 648 | 0.316 ± 0.010 | 480 ± 7 | 26.3 ± 0.6 |
+| rule | 1046 ± 60 | 2298 ± 619 | 0.304 ± 0.022 | 485 ± 11 | 26.3 ± 1.2 |
+| ai | 979 ± 28 | 1901 ± 367 | 0.317 ± 0.008 | 479 ± 9 | 26.0 ± 1.0 |
+
+**E9 Control-interval sweep** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | errors | overload (s) | switches/min |
+|---|---:|---:|---:|---:|
+| swrr | 902 ± 200 | 0.270 ± 0.057 | 45.0 ± 2.0 | 0.00 ± 0.00 |
+| ai@10s | 873 ± 0 | 0.288 ± 0.002 | 45.0 ± 1.7 | 7.06 ± 0.88 |
+| ai@1s | 968 ± 129 | 0.298 ± 0.010 | 47.7 ± 1.5 | 7.06 ± 2.33 |
+| ai@30s | 995 ± 28 | 0.283 ± 0.036 | 46.7 ± 2.5 | 2.35 ± 1.02 |
+| ai@5s | 948 ± 26 | 0.296 ± 0.006 | 45.0 ± 3.0 | 7.06 ± 3.85 |
+| ai@60s | 1045 ± 29 | 0.305 ± 0.009 | 45.0 ± 3.6 | 1.18 ± 1.02 |
+
+**E10 Ablation** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | p99 (ms) | errors | imbalance CV | switches/min |
+|---|---:|---:|---:|---:|---:|
+| ai_full | 863 ± 94 | 1101 ± 120 | 0.301 ± 0.017 | 0.122 ± 0.037 | 8.57 ± 0.00 |
+| ai_no_context | 965 ± 79 | 1372 ± 267 | 0.297 ± 0.045 | 0.222 ± 0.087 | 8.57 ± 1.71 |
+| ai_no_ema | 966 ± 94 | 1739 ± 610 | 0.315 ± 0.012 | 0.176 ± 0.023 | 8.57 ± 0.00 |
+| ai_no_hysteresis | 948 ± 26 | 1846 ± 52 | 0.279 ± 0.044 | 0.266 ± 0.055 | 9.14 ± 0.99 |
+| ai_no_safety | 906 ± 99 | 1416 ± 402 | 0.303 ± 0.022 | 0.400 ± 0.083 | 6.86 ± 0.00 |
+| rule_full | 851 ± 115 | 1174 ± 114 | 0.252 ± 0.077 | 0.093 ± 0.051 | 0.00 ± 0.00 |
+| rule_no_deadband | 904 ± 67 | 1570 ± 475 | 0.296 ± 0.010 | 0.150 ± 0.080 | 0.00 ± 0.00 |
+| rule_no_ema | 965 ± 83 | 2064 ± 435 | 0.280 ± 0.022 | 0.138 ± 0.066 | 0.00 ± 0.00 |
+
+**A1 Affinity workload** (mean ± sd over 3 runs)
+
+| condition | p95 (ms) | errors | stickiness | imbalance CV |
+|---|---:|---:|---:|---:|
+| rr | 22.9 ± 0.6 | 0.0000 ± 0.0000 | 0.394 ± 0.002 | 0.000 ± 0.000 |
+| lc | 22.9 ± 0.6 | 0.0000 ± 0.0000 | 0.392 ± 0.002 | 0.003 ± 0.002 |
+| swrr | 22.9 ± 0.6 | 0.0000 ± 0.0000 | 0.393 ± 0.001 | 0.000 ± 0.000 |
+| ch | 22.5 ± 0.0 | 0.0000 ± 0.0000 | 1.000 ± 0.000 | 0.064 ± 0.022 |
+| rule | 22.5 ± 0.0 | 0.0000 ± 0.0000 | 0.392 ± 0.001 | 0.000 ± 0.000 |
+| ai | 23.6 ± 1.2 | 0.0000 ± 0.0000 | 0.549 ± 0.269 | 0.013 ± 0.023 |
+
+**Controller overhead** (means over the 105 runs of E1–E7; LB CPU is % of one core)
+
+| policy | runs | LB CPU % | LB RSS MB | AI process CPU % / RSS MB | decision latency avg / max (ms) | decisions per run (accepted) | agent failures | switches/min |
+|---|---:|---:|---:|---|---|---|---|---|
+| rr | 21 | 78.1 | 33 | – | – | – | – | 0.00 |
+| lc | 21 | 83.5 | 25 | – | – | – | – | 0.00 |
+| swrr | 21 | 76.0 | 27 | – | – | – | – | 0.00 |
+| rule | 21 | 78.4 | 27 | – | – | – | – | 0.00 |
+| ai | 21 | 78.4 | 28 | 0.32 / 38 | 15.7 / 24.9 | 7.6 (1.6) | 0.0 | 2.65 |
+
+
+### 19.6 What the data does and does not show
+*(Descriptive, n = 3; effect sizes are large where stated, but no result is claimed as significant.)*
+
+1. **E1 — no unnecessary overhead or switching.** All five policies are indistinguishable (p95 22.5–23.3 ms, 0 errors). The AI made **0 policy switches in all three runs** (it proposed changes, which hysteresis/margin rejected) and its extra cost was the decision traffic: ~16 ms per decision, 0.32 % of one core and 38 MB for the Python process, LB CPU unchanged (78.4 % vs 76–84 % for the baselines).
+2. **E2 — capacity awareness.** Round Robin overloads the smallest backend (3.6 % errors, p95 536 ms, imbalance CV 0.46); every capacity-aware policy has 0 errors and p95 ≈ 23 ms. **The AI matches static SWRR only because it starts on static SWRR and never switched** (0 switches/min); this is the baseline's merit, not a learned one. Least Connections is slightly slower (35 ms) at this load.
+3. **E3 CPU imbalance and E4 latency imbalance — the best fixed policy is Least Connections, and the AI did not find it in time.** E3: LC p95 **35 ms**, 0 s overload; static SWRR 328 ms, 24 s overload; rule 270 ms; AI 285 ms with 18 s overload (a 13 % lower p95 and 6 s less overload than SWRR, within the noise of 3 runs). E4: LC p95 175 ms and **0 % errors**; static SWRR / RR 684 ms and 14.7 % errors; rule-based 6.5 %; AI 11.5 %. The AI's cold-start exploration plus ≈ 1.3 safety fallbacks per run (which lock it out and return to SWRR for 12 s each) consume most of a 36 s run.
+4. **E5 long requests — exploration has a cost.** Static SWRR and the rule controller are best (p99 ≈ 555–563 ms, 0 errors); LC 611 ms; RR 13.5 % errors; **the AI is worse than static SWRR (3.8 % errors, p99 903 ms)** because its first decisions try untried strategies (including RR) under load. This is the price of an untrained model in a short run, not a property of a converged policy.
+5. **E6 flash crowd.** Every policy except RR keeps 0 errors and p95 23–32 ms through the 200 → 1400 rps ramp (0 s overload); RR loses 2.9 % of requests with 11 s of overload. The AI made no switches, so it again equals the static baseline.
+6. **E7 failure/recovery.** Detection is **1.00 s for every policy** (the 1 s health-check interval is the floor; the policy does not influence it); the backend is marked up 1.00 s after restoration, and its traffic share is back to ≥ 80 % of its capacity share after **3.0–4.0 s**. Only RR suffers (p95 356 ms, 11.7 s of overload) because it keeps sending an equal share to the weakest backends.
+7. **E8 mixed workload — inconclusive by design flaw.** Every policy runs at **27–32 % errors** with ~24–27 s of overload: the combined faults (CPU burner + added latency + a backend down) exceed the pool's capacity, so the scenario does not discriminate between policies and does **not** answer "does learned selection generalize?". It needs recalibrating (lower load or milder faults) before E8–E10 conclusions are drawn.
+8. **E9 interval sweep — the instability side of the tradeoff is visible.** Policy switches per minute: **7.1 at 1, 5 and 10 s**, **2.4 at 30 s**, **1.2 at 60 s**, while latency and errors do not differ beyond noise from static SWRR (p95 873–1045 ms vs 902 ms). Short intervals therefore add churn without measurable benefit here. Because the LB's metrics window is 10 s, intervals < 10 s also receive rewards that are not attributable to the last policy.
+9. **E10 ablation — nothing is separable at n = 3.** p95/p99 and error rate of the eight arms overlap within one SD. The one visible difference is utilization imbalance: **without the safety layer 0.40 vs 0.12 with it** (the safety fallback returns the system to the capacity-weighted baseline), which is a hypothesis for the 5+ repetition run, not a finding. Without EMA or deadband the rule controller's p99 rises (2064 / 1570 ms vs 1174 ms), again within noise.
+10. **A1 affinity.** Consistent Hash gives **stickiness 1.000** vs ≈ 0.39 for every other policy, at no latency cost on this balanced pool (p95 22.5 ms) and with a small imbalance (CV 0.064). The AI had CH available and chose it in **1 of 3 runs** (mean stickiness 0.55): the learner has no notion of affinity in its reward, so affinity is only preserved when it happens to pick CH — an affinity requirement must be enforced by the operator (restrict the action mask to CH), not left to the reward.
+
+**Overall.** In this setup (36 s runs, cold-start model, 3 repetitions) **no policy was shown to beat the best fixed baseline, and the AI never beat Least Connections where LC is clearly best (E3, E4)**. The AI's value here is bounded: it adds negligible overhead (E1), tracks the capacity-weighted baseline, and its safety layer caps the damage of exploration — but short runs mostly measure its learning cost. Which fixed policy is best depends on the scenario (SWRR for E5, LC for E3/E4, anything but RR for E2/E6), which is the argument for a learner; demonstrating that it converges to the right one requires longer runs, a pre-trained or warm-started arm, and ≥ 5 repetitions.
+
+### 19.7 Defects found by the experiments (fixed before the reported pass)
+| Defect | How it appeared | Fix |
+| :--- | :--- | :--- |
+| Cold-start deadlock: switch margin blocked all first-time exploration | pilot: AI never left the baseline | `explored` flag exempts first-time exploration from the margin (§16.5) |
+| **Reverse proxy re-dialled backends per request** (default transport: 2 idle connections per host) | **first full pass: 104 of 180 runs invalid** (generator starved: schedule lag up to 10 s, up to 13,719 dropped sends, "10000-thread limit" crashes); LB used 2.4–4.3 cores (≈ 3–4 ms CPU per request) at ≥ 600 rps | shared pooled transport (1024 idle connections per backend); LB CPU at 1100 rps fell from peaks of ≈ 380–430 % to a mean of ≈ 126 % (peak ≈ 192 %); regression test `TestProxyReusesBackendConnections` (it fails with the default transport) |
+| Load generator resolved `localhost` per dial (blocking resolver thread per connection) | thread exhaustion crashes in 6 first-pass runs | literal `127.0.0.1` target + thread cap |
+| Holm correction counted untestable (NaN) comparisons | unit test | only testable p-values count |
+| Empty 1 Hz LB samples treated as data | `KeyError` in the analysis | incomplete samples are skipped (tested) |
+
+The validity gate worked as designed: it flagged the invalid first-pass data instead of letting it into the statistics. The **first pass is not reported** (different LB build, 58 % invalid); the second pass re-ran the entire matrix after the fixes. E2's offered load was raised from 1100 to 1300 rps because, with the generator no longer starved, RR at 1100 rps no longer overloaded the smallest backend.
+
+### 19.8 Limitations
+* **n = 3**, 36 s runs, one machine (12-thread laptop CPU shared by generator, LB, backends and agent; LB CPU 76–84 % of one core in E1–E7; mean system CPU 44 %), no repetitions across days or machines. **Six runs had a one-second system-CPU spike above 90 %** (E2_lc_r0, E8_ai_r2, E8_swrr_r2, E9_ai_r0_i10, E9_ai_r2_i30, E9_swrr_r2). They are flagged in the report and kept (their generator lag stayed ≤ 3.9 ms), but a re-run is advisable before any of them is used in a claim.
+* **Cold-start AI only.** A trained or warm-started arm, longer horizons, and the learner's reward model under these faults remain to be studied; AI results here measure early learning, not convergence.
+* **E8–E10 saturate** (≈ 30 % errors for all policies), so the ablation and interval sweep have low power; recalibrate E8 first.
+* The 1 s health-check interval is the detection floor in E7; the in-LB request-path overhead metric is below its resolution (§19.4).
+* Static thresholds (safety fallback, margins, reward weights, α) were set a priori / on the Phase 9 simulator, not tuned on these scenarios.
+
+### 19.9 How to run
+```bash
+python -m experiments.generator.build_scenarios                     # (re)generate scenarios + experiments.json
+python -m experiments.runner.matrix --experiments all --reps 3      # ~2.3 h; resumable; add --reps 5 to extend
+python -m experiments.runner.matrix --experiments E4 --reps 5 --dry-run     # inspect the randomized order only
+python -m experiments.analysis.report                                # statistics, report.md, plots
+python -m pytest experiments/tests ai/tests -q                       # 154 Python tests (27 for this phase)
+```
+
+---
+
+## 20. Architectural Summary & Best Practices
 
 ```mermaid
 flowchart LR
@@ -970,6 +1272,18 @@ flowchart LR
 
     Loadgen --> LB
     Loadgen -.->|"/__fault"| FBackends
+
+    subgraph Pipeline["Phase 14-17: Experiment Pipeline"]
+        Matrix["Matrix scheduler (randomized rounds, paired seeds)"]
+        RunOne["Run executor (isolated stack, policy mode, warm-up)"]
+        Raw["Raw records (window_metrics.csv, decisions.jsonl, samples, metadata)"]
+        Stats["Analysis (histograms, CIs, paired tests, claim rule)"]
+    end
+
+    Matrix --> RunOne
+    RunOne --> Loadgen
+    RunOne --> Raw
+    Raw --> Stats
 ```
 
 ### Engineering Best Practices Implemented
@@ -982,10 +1296,11 @@ flowchart LR
 
 ---
 
-## 17. Next Steps & Road Ahead
+## 21. Next Steps & Road Ahead
 
-* **Run the Go race detector** (`go test -race ./...`) on a 64-bit toolchain, including under load with policy switching enabled (Phase 11 requirement; not possible on the current machine).
-* **Tune the Phase 12 safety thresholds and the reward weights on development scenarios**, then freeze them and report them in the experimental setup.
-* **Long-horizon, multi-seed live evaluation**: the learner vs RR / LC / static SWRR / rule-based on the Phase 13 scenarios, with repetitions and confidence intervals; a heavier flash crowd and CPU-limited per-backend processes so the scenarios actually separate policies.
-* **Per-backend resource metrics** (process-level CPU/memory) so CPU/memory features discriminate between backends.
-* **Live shadow evaluation** of the agent (`LB_AGENT_SHADOW=1`) before enabling it; non-stationarity (forgetting factor) for the bandit; report Consistent Hash separately on affinity workloads.
+* **Extend the matrix to the plan's minimum of 5 repetitions** (`--reps 5`, resumable) and beyond (≥ 6 pairs are needed for any paired test to reach p < 0.05); then re-read §19.6 under the claim rule.
+* **Recalibrate E8** (and hence E9/E10) so that the mixed scenario does not saturate every policy; re-run the ablation and the interval sweep.
+* **Warm-start / pre-trained AI arm and longer horizons**, so the comparison measures a converged learner, not only the cold-start cost; consider an action mask that enforces affinity on affinity workloads (A1).
+* **Run the Go race detector** (`go test -race ./...`) on a 64-bit toolchain, including under load with policy switching enabled (still not possible on the current machine).
+* **Tune the Phase 12 safety thresholds and the reward weights on development scenarios**, freeze them, and report them in the experimental setup.
+* **Per-backend resource metrics** (process-level CPU/memory) so CPU/memory features discriminate between backends; report Consistent Hash separately on affinity workloads.

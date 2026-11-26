@@ -194,9 +194,15 @@ def _markdown(matrix, runs, valid, failed, excluded, disturbed, by_exp, comps) -
                 cells.append(fmt(stats.summarize([r.get(key, NAN) if r.get(key) is not None else NAN for r in groups[lab]]), d))
             L.append(f"| **{lab}** | " + " | ".join(cells) + " |")
         L.append("")
-        ec = [c for c in comps if c["experiment"] == exp_key and c["metric"] in ("p95_ms", "error_rate", "ok_rps", "p99_ms")]
+        ec = [c for c in comps if c["experiment"] == exp_key and c["metric"] in ("p95_ms", "error_rate")]
         if ec:
-            L.append("Paired comparisons (candidate − reference; negative is better for latency/error):\n")
+            npairs = sorted({c["n_pairs"] for c in ec})
+            note = ""
+            if max(npairs) < stats.MIN_N:
+                note = (f" With n = {', '.join(map(str, npairs))} pairs no verdict can be anything but `insufficient_n` "
+                        f"(smallest attainable p = {stats.min_attainable_p(max(npairs)):.3f}); the differences are descriptive.")
+            L.append("Paired comparisons for p95 and error rate (candidate − reference; negative is better). "
+                     "All metrics are in `comparisons.csv`." + note + "\n")
             L.append("| metric | candidate vs reference | mean diff [95% CI] | p (Holm) | verdict |")
             L.append("|---|---|---|---|---|")
             for c in ec:

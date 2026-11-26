@@ -1,0 +1,124 @@
+{
+ "run_id": "E6_rule_r1",
+ "experiment": "E6",
+ "arm": "rule",
+ "repetition": 1,
+ "seed": 1001,
+ "date_utc": "2026-11-26T10:31:30.661313+00:00",
+ "git": {
+  "commit": "e13c34256ffb9a960fa25b59d366d3abd51dca8b",
+  "branch": "AI-Agent",
+  "dirty": false,
+  "dirty_files": []
+ },
+ "hardware": {
+  "cpu": "Intel64 Family 6 Model 186 Stepping 3, GenuineIntel",
+  "logical_cores": 12,
+  "physical_cores": 10,
+  "ram_gb": 15.7,
+  "os": "Windows-11-10.0.26200-SP0",
+  "machine": "AMD64"
+ },
+ "versions": {
+  "go": "go version go1.27.1 windows/amd64",
+  "python": "3.13.3",
+  "numpy": "2.2.5"
+ },
+ "scenario": {
+  "file": "scenarios/e6_flash_crowd.json",
+  "name": "e6_flash_crowd",
+  "sha256": "8a8bf28b2fe8c6413e9b015d9754ce23bde560ac7d77c86f44977c1b869a0d76",
+  "definition": {
+   "name": "e6_flash_crowd",
+   "description": "200 rps, ramp to 1400 rps over 8 s from t=10 s, hold 10 s, ramp down.",
+   "seed": 1000,
+   "request_path": "/work",
+   "arrivals": "poisson",
+   "phases": [
+    {
+     "type": "fixed",
+     "duration_s": 10,
+     "rps": 200
+    },
+    {
+     "type": "ramp",
+     "duration_s": 8,
+     "from_rps": 200,
+     "to_rps": 1400
+    },
+    {
+     "type": "fixed",
+     "duration_s": 10,
+     "rps": 1400
+    },
+    {
+     "type": "ramp",
+     "duration_s": 8,
+     "from_rps": 1400,
+     "to_rps": 200
+    }
+   ],
+   "mix": {
+    "long_fraction": 0.0,
+    "long_delay_ms": 0,
+    "short_delay_ms": 0
+   },
+   "faults": [],
+   "timeout_ms": 5000,
+   "max_in_flight": 5000
+  }
+ },
+ "config": {
+  "policy": "rule",
+  "agent": null,
+  "interval_s": null,
+  "pool_name": "hetero",
+  "pool": [
+   {
+    "name": "Backend-1",
+    "port": 8081,
+    "conc": 24,
+    "weight": 3,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-2",
+    "port": 8082,
+    "conc": 16,
+    "weight": 2,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-3",
+    "port": 8083,
+    "conc": 8,
+    "weight": 1,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   }
+  ],
+  "lb_env": {
+   "LB_BACKENDS": "Backend-1:8081:3,Backend-2:8082:2,Backend-3:8083:1",
+   "LB_NO_DUMMY": "1",
+   "LB_HEALTH_INTERVAL_MS": "1000",
+   "LB_QUIET": "1",
+   "LB_SAFE_ACTION": "2",
+   "LB_CONTROLLER_INTERVAL_S": "3"
+  },
+  "window_s": 4,
+  "warmup_s": 8,
+  "sample_rate": 0.01,
+  "ai_defaults": null
+ },
+ "wall_clock_s": 37.5,
+ "status": {
+  "ok": true,
+  "loadgen_stdout": "e6_flash_crowd: offered=28691 completed=28691 errors=0 error_rate=0.0000 p50=21.9ms p95=24.0ms p99=26.7ms generator_ok=true",
+  "final_strategy": "Adaptive-Weighted-Round-Robin",
+  "final_policy_reason": "action",
+  "decisions": 0,
+  "generator_ok": true
+ }
+}

@@ -1,0 +1,465 @@
+{
+ "enabled": true,
+ "config": {
+  "url": "http://127.0.0.1:8090",
+  "request_timeout_ns": 2000000000,
+  "settle_ns": 333000000,
+  "measure_ns": 667000000,
+  "step_every_ns": 500000000,
+  "failure_backoff_ns": 10000000000,
+  "min_samples": 20
+ },
+ "stats": {
+  "requests": 33,
+  "successes": 33,
+  "failures_by_kind": {},
+  "held_stale_state": 2,
+  "last_latency_ms": 6.979,
+  "max_latency_ms": 20.023,
+  "avg_latency_ms": 8.87930303030303
+ },
+ "manager": {
+  "config": {
+   "max_decision_age_ns": 5000000000,
+   "min_policy_age_ns": 1000000000,
+   "switch_margin": 0.02,
+   "safety_cooldown_ns": 12000000000,
+   "max_error_rate": 0.1,
+   "max_p99_ms": 2000,
+   "safety_min_requests": 20,
+   "safe_action": 2,
+   "min_weight": 0.05,
+   "max_weight": 0.8,
+   "shadow": false
+  },
+  "killed": false,
+  "baseline_strategy": "Smooth-Weighted-Round-Robin",
+  "safety_locked_until": "2026-11-26T17:04:01.8214525+05:30",
+  "last_switch_at": "2026-11-26T17:03:49.8214525+05:30",
+  "reason_counts": {
+   "applied": 8,
+   "rejected_switch_margin": 23,
+   "retained_same": 2,
+   "safety_fallback": 4
+  },
+  "safety_events": [
+   {
+    "at": "2026-11-26T17:03:11.3214525+05:30",
+    "kind": "fallback",
+    "reason": "p99=2352ms>=2000ms"
+   },
+   {
+    "at": "2026-11-26T17:03:24.8214525+05:30",
+    "kind": "fallback",
+    "reason": "error_fraction=0.287>=0.100"
+   },
+   {
+    "at": "2026-11-26T17:03:37.3214525+05:30",
+    "kind": "fallback",
+    "reason": "error_fraction=0.599>=0.100"
+   },
+   {
+    "at": "2026-11-26T17:03:49.8214525+05:30",
+    "kind": "fallback",
+    "reason": "error_fraction=0.441>=0.100"
+   }
+  ]
+ },
+ "policy": {
+  "strategy": "Smooth-Weighted-Round-Robin",
+  "weights": [
+   0.5,
+   0.3333333333333333,
+   0.16666666666666666
+  ],
+  "backend_ids": [
+   "Backend-1",
+   "Backend-2",
+   "Backend-3"
+  ],
+  "version": 16,
+  "created_at": "2026-11-26T17:03:49.8351652+05:30",
+  "reason": "safety:error_fraction=0.441>=0.100"
+ },
+ "recent_decisions": [
+  {
+   "decision_id": "",
+   "at": "2026-11-26T17:02:39.3214525+05:30",
+   "latency_ms": 0,
+   "current_strategy": "static_swrr",
+   "reason": "held_stale_or_invalid_state",
+   "applied": false
+  },
+  {
+   "decision_id": "",
+   "at": "2026-11-26T17:02:39.8214525+05:30",
+   "latency_ms": 0,
+   "current_strategy": "static_swrr",
+   "reason": "held_stale_or_invalid_state",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00001",
+   "at": "2026-11-26T17:02:40.3214525+05:30",
+   "latency_ms": 6.879,
+   "current_strategy": "static_swrr",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "explore",
+   "model_version": "linucb-v1+0u",
+   "reason": "retained_same",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00002",
+   "at": "2026-11-26T17:02:41.3214525+05:30",
+   "latency_ms": 15.815,
+   "current_strategy": "static_swrr",
+   "proposed_strategy": "rule_based_adaptive",
+   "diagnostic": "explore",
+   "model_version": "linucb-v1+1u",
+   "reason": "applied",
+   "applied": true
+  },
+  {
+   "decision_id": "window-00003",
+   "at": "2026-11-26T17:02:42.8214525+05:30",
+   "latency_ms": 18.488,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "round_robin",
+   "diagnostic": "explore",
+   "model_version": "linucb-v1+2u",
+   "reason": "applied",
+   "applied": true
+  },
+  {
+   "decision_id": "window-00004",
+   "at": "2026-11-26T17:02:44.3214525+05:30",
+   "latency_ms": 17.203,
+   "current_strategy": "round_robin",
+   "proposed_strategy": "least_connections",
+   "diagnostic": "explore",
+   "model_version": "linucb-v1+3u",
+   "reason": "applied",
+   "applied": true
+  },
+  {
+   "decision_id": "window-00005",
+   "at": "2026-11-26T17:02:45.8214525+05:30",
+   "latency_ms": 17.736,
+   "current_strategy": "least_connections",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+4u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00006",
+   "at": "2026-11-26T17:02:46.8214525+05:30",
+   "latency_ms": 5.232,
+   "current_strategy": "least_connections",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+4u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00007",
+   "at": "2026-11-26T17:02:47.8214525+05:30",
+   "latency_ms": 5.672,
+   "current_strategy": "least_connections",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+4u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00008",
+   "at": "2026-11-26T17:02:48.8214525+05:30",
+   "latency_ms": 6.335,
+   "current_strategy": "least_connections",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+4u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00009",
+   "at": "2026-11-26T17:02:49.8214525+05:30",
+   "latency_ms": 5.259,
+   "current_strategy": "least_connections",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+4u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00010",
+   "at": "2026-11-26T17:02:50.8214525+05:30",
+   "latency_ms": 4.96,
+   "current_strategy": "least_connections",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+4u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00011",
+   "at": "2026-11-26T17:02:51.8214525+05:30",
+   "latency_ms": 6.925,
+   "current_strategy": "least_connections",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+4u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00012",
+   "at": "2026-11-26T17:02:52.8214525+05:30",
+   "latency_ms": 5.484,
+   "current_strategy": "least_connections",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+4u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00013",
+   "at": "2026-11-26T17:02:53.8214525+05:30",
+   "latency_ms": 6.106,
+   "current_strategy": "least_connections",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "explore",
+   "model_version": "linucb-v1+4u",
+   "reason": "applied",
+   "applied": true
+  },
+  {
+   "decision_id": "window-00014",
+   "at": "2026-11-26T17:02:55.3214525+05:30",
+   "latency_ms": 17.664,
+   "current_strategy": "static_swrr",
+   "proposed_strategy": "rule_based_adaptive",
+   "diagnostic": "explore",
+   "model_version": "linucb-v1+5u",
+   "reason": "applied",
+   "applied": true
+  },
+  {
+   "decision_id": "window-00015",
+   "at": "2026-11-26T17:02:56.8214525+05:30",
+   "latency_ms": 18.021,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00016",
+   "at": "2026-11-26T17:02:57.8214525+05:30",
+   "latency_ms": 6.822,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00017",
+   "at": "2026-11-26T17:02:58.8214525+05:30",
+   "latency_ms": 6.132,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00018",
+   "at": "2026-11-26T17:02:59.8214525+05:30",
+   "latency_ms": 5.272,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00019",
+   "at": "2026-11-26T17:03:00.8214525+05:30",
+   "latency_ms": 5.173,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00020",
+   "at": "2026-11-26T17:03:01.8214525+05:30",
+   "latency_ms": 6.335,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00021",
+   "at": "2026-11-26T17:03:02.8214525+05:30",
+   "latency_ms": 6.952,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00022",
+   "at": "2026-11-26T17:03:03.8214525+05:30",
+   "latency_ms": 6.637,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00023",
+   "at": "2026-11-26T17:03:04.8214525+05:30",
+   "latency_ms": 8.632,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00024",
+   "at": "2026-11-26T17:03:05.8214525+05:30",
+   "latency_ms": 6.759,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00025",
+   "at": "2026-11-26T17:03:06.8214525+05:30",
+   "latency_ms": 9.557,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00026",
+   "at": "2026-11-26T17:03:07.8214525+05:30",
+   "latency_ms": 6.323,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00027",
+   "at": "2026-11-26T17:03:08.8214525+05:30",
+   "latency_ms": 7.348,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00028",
+   "at": "2026-11-26T17:03:09.8214525+05:30",
+   "latency_ms": 6.44,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00029",
+   "at": "2026-11-26T17:03:10.8214525+05:30",
+   "latency_ms": 7.292,
+   "current_strategy": "rule_based_adaptive",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "rejected_switch_margin",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00030",
+   "at": "2026-11-26T17:03:23.3214525+05:30",
+   "latency_ms": 5.484,
+   "current_strategy": "static_swrr",
+   "proposed_strategy": "static_swrr",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+6u",
+   "reason": "retained_same",
+   "applied": false
+  },
+  {
+   "decision_id": "window-00031",
+   "at": "2026-11-26T17:03:24.3214525+05:30",
+   "latency_ms": 20.023,
+   "current_strategy": "static_swrr",
+   "proposed_strategy": "rule_based_adaptive",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+7u",
+   "reason": "applied",
+   "applied": true
+  },
+  {
+   "decision_id": "window-00032",
+   "at": "2026-11-26T17:03:36.8214525+05:30",
+   "latency_ms": 7.078,
+   "current_strategy": "static_swrr",
+   "proposed_strategy": "rule_based_adaptive",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+7u",
+   "reason": "applied",
+   "applied": true
+  },
+  {
+   "decision_id": "window-00033",
+   "at": "2026-11-26T17:03:49.3214525+05:30",
+   "latency_ms": 6.979,
+   "current_strategy": "static_swrr",
+   "proposed_strategy": "rule_based_adaptive",
+   "diagnostic": "ok",
+   "model_version": "linucb-v1+7u",
+   "reason": "applied",
+   "applied": true
+  }
+ ]
+}

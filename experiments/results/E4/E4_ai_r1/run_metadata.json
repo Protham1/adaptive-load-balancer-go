@@ -1,0 +1,134 @@
+{
+ "run_id": "E4_ai_r1",
+ "experiment": "E4",
+ "arm": "ai",
+ "repetition": 1,
+ "seed": 1001,
+ "date_utc": "2026-11-26T10:56:13.318814+00:00",
+ "git": {
+  "commit": "e13c34256ffb9a960fa25b59d366d3abd51dca8b",
+  "branch": "AI-Agent",
+  "dirty": false,
+  "dirty_files": []
+ },
+ "hardware": {
+  "cpu": "Intel64 Family 6 Model 186 Stepping 3, GenuineIntel",
+  "logical_cores": 12,
+  "physical_cores": 10,
+  "ram_gb": 15.7,
+  "os": "Windows-11-10.0.26200-SP0",
+  "machine": "AMD64"
+ },
+ "versions": {
+  "go": "go version go1.27.1 windows/amd64",
+  "python": "3.13.3",
+  "numpy": "2.2.5"
+ },
+ "scenario": {
+  "file": "scenarios/e4_latency_imbalance.json",
+  "name": "e4_latency_imbalance",
+  "sha256": "bb12a2c39a1d13794550af65200fd2eb584886d740a2e66082185efcd6c4025a",
+  "definition": {
+   "name": "e4_latency_imbalance",
+   "description": "Backend-2 gains +150 ms from t=12 s (sustained).",
+   "seed": 1000,
+   "request_path": "/work",
+   "arrivals": "poisson",
+   "phases": [
+    {
+     "type": "fixed",
+     "duration_s": 36,
+     "rps": 600
+    }
+   ],
+   "mix": {
+    "long_fraction": 0.0,
+    "long_delay_ms": 0,
+    "short_delay_ms": 0
+   },
+   "faults": [
+    {
+     "at_s": 12,
+     "backend": "Backend-2",
+     "set": {
+      "delay_ms": 150
+     }
+    }
+   ],
+   "timeout_ms": 5000,
+   "max_in_flight": 5000
+  }
+ },
+ "config": {
+  "policy": "ai",
+  "agent": {
+   "algo": "linucb",
+   "alpha": 0.05,
+   "context": "compact",
+   "seed": 1001
+  },
+  "interval_s": null,
+  "pool_name": "hetero",
+  "pool": [
+   {
+    "name": "Backend-1",
+    "port": 8081,
+    "conc": 24,
+    "weight": 3,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-2",
+    "port": 8082,
+    "conc": 16,
+    "weight": 2,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-3",
+    "port": 8083,
+    "conc": 8,
+    "weight": 1,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   }
+  ],
+  "lb_env": {
+   "LB_BACKENDS": "Backend-1:8081:3,Backend-2:8082:2,Backend-3:8083:1",
+   "LB_NO_DUMMY": "1",
+   "LB_HEALTH_INTERVAL_MS": "1000",
+   "LB_QUIET": "1",
+   "LB_SAFE_ACTION": "2",
+   "LB_CONTROLLER_INTERVAL_S": "3",
+   "LB_AGENT_SETTLE_S": "2",
+   "LB_AGENT_MEASURE_S": "4",
+   "LB_AGENT_MIN_POLICY_AGE_S": "6",
+   "LB_AGENT_SAFETY_COOLDOWN_S": "12",
+   "LB_AGENT_STEP_S": "1"
+  },
+  "window_s": 4,
+  "warmup_s": 8,
+  "sample_rate": 0.01,
+  "ai_defaults": {
+   "algo": "linucb",
+   "alpha": 0.05,
+   "context": "compact",
+   "settle_s": 2,
+   "measure_s": 4,
+   "min_policy_age_s": 6,
+   "safety_cooldown_s": 12,
+   "step_s": 1
+  }
+ },
+ "wall_clock_s": 39.8,
+ "status": {
+  "ok": true,
+  "loadgen_stdout": "e4_latency_imbalance: offered=21479 completed=21479 errors=1168 error_rate=0.0544 p50=21.7ms p95=557.7ms p99=670.2ms generator_ok=true",
+  "final_strategy": "Smooth-Weighted-Round-Robin",
+  "final_policy_reason": "safety:error_fraction=0.114>=0.100",
+  "decisions": 7,
+  "generator_ok": true
+ }
+}

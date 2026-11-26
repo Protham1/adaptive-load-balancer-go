@@ -1,0 +1,110 @@
+{
+ "run_id": "A1_lc_r1",
+ "experiment": "A1",
+ "arm": "lc",
+ "repetition": 1,
+ "seed": 1001,
+ "date_utc": "2026-11-26T11:05:33.137321+00:00",
+ "git": {
+  "commit": "e13c34256ffb9a960fa25b59d366d3abd51dca8b",
+  "branch": "AI-Agent",
+  "dirty": false,
+  "dirty_files": []
+ },
+ "hardware": {
+  "cpu": "Intel64 Family 6 Model 186 Stepping 3, GenuineIntel",
+  "logical_cores": 12,
+  "physical_cores": 10,
+  "ram_gb": 15.7,
+  "os": "Windows-11-10.0.26200-SP0",
+  "machine": "AMD64"
+ },
+ "versions": {
+  "go": "go version go1.27.1 windows/amd64",
+  "python": "3.13.3",
+  "numpy": "2.2.5"
+ },
+ "scenario": {
+  "file": "scenarios/a1_affinity.json",
+  "name": "a1_affinity",
+  "sha256": "5095825ae29259d4c1178d8e5900445f0bbb09518408a13ef06054dbc135854d",
+  "definition": {
+   "name": "a1_affinity",
+   "description": "Equal backends, 400 rps from 200 synthetic clients; affinity (stickiness) matters.",
+   "seed": 1000,
+   "request_path": "/work",
+   "arrivals": "poisson",
+   "phases": [
+    {
+     "type": "fixed",
+     "duration_s": 36,
+     "rps": 400
+    }
+   ],
+   "mix": {
+    "long_fraction": 0.0,
+    "long_delay_ms": 0,
+    "short_delay_ms": 0,
+    "clients": 200
+   },
+   "faults": [],
+   "timeout_ms": 5000,
+   "max_in_flight": 5000,
+   "track_backend": true
+  }
+ },
+ "config": {
+  "policy": "lc",
+  "agent": null,
+  "interval_s": null,
+  "pool_name": "balanced",
+  "pool": [
+   {
+    "name": "Backend-1",
+    "port": 8081,
+    "conc": 16,
+    "weight": 1,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-2",
+    "port": 8082,
+    "conc": 16,
+    "weight": 1,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   },
+   {
+    "name": "Backend-3",
+    "port": 8083,
+    "conc": 16,
+    "weight": 1,
+    "gomaxprocs": 0,
+    "cpu_work_us": 300
+   }
+  ],
+  "lb_env": {
+   "LB_BACKENDS": "Backend-1:8081:1,Backend-2:8082:1,Backend-3:8083:1",
+   "LB_NO_DUMMY": "1",
+   "LB_HEALTH_INTERVAL_MS": "1000",
+   "LB_QUIET": "1",
+   "LB_SAFE_ACTION": "2",
+   "LB_CONTROLLER_INTERVAL_S": "3",
+   "LB_AFFINITY_REQUIRED": "1"
+  },
+  "window_s": 4,
+  "warmup_s": 8,
+  "sample_rate": 0.01,
+  "ai_defaults": null
+ },
+ "wall_clock_s": 37.9,
+ "status": {
+  "ok": true,
+  "loadgen_stdout": "a1_affinity: offered=14306 completed=14306 errors=0 error_rate=0.0000 p50=21.6ms p95=22.4ms p99=23.0ms generator_ok=true",
+  "final_strategy": "Least-Connections",
+  "final_policy_reason": "action",
+  "decisions": 0,
+  "generator_ok": true
+ }
+}
