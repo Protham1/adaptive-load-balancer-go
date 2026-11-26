@@ -88,8 +88,8 @@ def experiments():
     D = 36
     sc = {}
     sc["e1_balanced"] = scenario("e1_balanced", "Equal backends, stable short requests, 300 rps.", [fixed(D, 300)])
-    sc["e2_heterogeneous"] = scenario("e2_heterogeneous", "3:2:1 capacity pool at 1100 rps (RR would give each backend 367 rps; "
-                                      "the smallest has ~390 rps capacity).", [fixed(D, 1100)])
+    sc["e2_heterogeneous"] = scenario("e2_heterogeneous", "3:2:1 capacity pool at 1300 rps (RR would give each backend 433 rps; "
+                                      "the smallest has ~390 rps capacity).", [fixed(D, 1300)])
     sc["e3_cpu_imbalance"] = scenario("e3_cpu_imbalance", "CPU-bound backends; sustained CPU burner (2 threads, 90% duty) "
                                       "inside Backend-1 from t=12 s.", [fixed(D, 600)],
                                       [fault(12, "Backend-1", cpu_burn=0.9, cpu_threads=2)])

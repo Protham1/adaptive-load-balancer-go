@@ -1,6 +1,6 @@
 {
  "name": "e2_heterogeneous",
- "description": "3:2:1 capacity pool at 1100 rps (RR would give each backend 367 rps; the smallest has ~390 rps capacity).",
+ "description": "3:2:1 capacity pool at 1300 rps (RR would give each backend 433 rps; the smallest has ~390 rps capacity).",
  "seed": 1000,
  "request_path": "/work",
  "arrivals": "poisson",
@@ -8,7 +8,7 @@
   {
    "type": "fixed",
    "duration_s": 36,
-   "rps": 1100
+   "rps": 1300
   }
  ],
  "mix": {

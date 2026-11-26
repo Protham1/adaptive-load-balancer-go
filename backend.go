@@ -513,6 +513,21 @@ func isBackendAlive(u *url.URL) bool {
 	return alive
 }
 
+// sharedProxyTransport is the connection pool used by every backend's reverse proxy. Go's default
+// transport keeps only 2 idle connections per host, so under concurrency the proxy dialled (and
+// closed) a new TCP connection to a backend for almost every request; profiling showed that dominated
+// the load balancer's CPU (about 1 ms per request in-process, 3-4 ms on Windows loopback), which
+// saturated the test machine at ~600 rps. Keeping idle connections per backend removes the churn.
+var sharedProxyTransport = &http.Transport{
+	Proxy:                 nil,
+	DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	MaxIdleConns:          4096,
+	MaxIdleConnsPerHost:   1024,
+	IdleConnTimeout:       90 * time.Second,
+	ResponseHeaderTimeout: 30 * time.Second,
+	DisableCompression:    true, // never re-compress / decompress payloads in the proxy
+}
+
 // NewBackend constructs a Backend with default weight 1 and a ReverseProxy
 func NewBackend(u *url.URL) *Backend {
 	return NewBackendNamedWithWeight(u, u.Host, 1)
@@ -526,6 +541,7 @@ func NewBackendWithWeight(u *url.URL, weight int) *Backend {
 // NewBackendNamedWithWeight constructs a Backend with name, weight, and ReverseProxy
 func NewBackendNamedWithWeight(u *url.URL, name string, weight int) *Backend {
 	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.Transport = sharedProxyTransport
 	b := &Backend{
 		URL:          u,
 		Name:         name,
