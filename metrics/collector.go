@@ -184,6 +184,13 @@ func (c *MetricsCollector) RecordStrategySwitch(newStrategy string, decisionDura
 	atomic.AddUint64(&c.switchCount, 1)
 }
 
+// SetPolicyVersion records the identifier of the active policy snapshot.
+func (c *MetricsCollector) SetPolicyVersion(v string) {
+	c.controllerMu.Lock()
+	c.policyVersion = v
+	c.controllerMu.Unlock()
+}
+
 // CollectSnapshot returns an immutable point-in-time snapshot of all metric groups.
 func (c *MetricsCollector) CollectSnapshot() *MetricsSnapshot {
 	now := time.Now()

@@ -17,6 +17,13 @@ type WeightedPeer interface {
 	GetWeight() int
 }
 
+// AdaptivePeer represents a weighted peer addressable by its stable name, which
+// is the backend ID used in policies and the State v1 vector
+type AdaptivePeer interface {
+	WeightedPeer
+	GetName() string
+}
+
 // HashablePeer represents a peer with a unique identification key for hash rings
 type HashablePeer interface {
 	Peer

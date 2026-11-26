@@ -356,7 +356,152 @@ type StateScalerConfig struct {
 
 ---
 
-## 7. Architectural Summary & Best Practices
+## 7. Phase 5 — Non-AI Adaptive Baseline (Rule-Based Controller)
+
+### 7.1 Objectives
+1. Provide a transparent, metric-based controller as the comparison point for the future learned agent ("does learning beat a reasonable heuristic?").
+2. Convert State v1 snapshots into **bounded dynamic weights** for an Adaptive Smooth Weighted Round Robin strategy.
+3. Keep updates stable: EMA smoothing, a maximum weight change per window, and hysteresis.
+4. Leave backend health to the existing health mechanism, independent of the controller.
+
+This controller is **not** the proposed AI. It only consumes the State v1 contract (`GET /api/state`), so it also exercises the metrics and policy interfaces the agent will use.
+
+### 7.2 Package Layout
+```text
+controller/
+  rule_based.go   Controller, Config, Decision, scoring, bounding, EMA/step/hysteresis
+  runner.go       Run(): one Update per 10 s decision window; publishes via a callback
+strategy/
+  adaptive_weighted_round_robin.go   SWRR driven by a dynamic weight snapshot
+  weighted_round_robin.go            shared SWRR core (static + adaptive variants)
+```
+
+### 7.3 Algorithm (per decision window)
+```text
+State v1 snapshot
+  -> (1) hold if SafePolicyRetainRecommended / IsStale / no healthy backend
+  -> (2) load score L_i in [0,1] per backend
+  -> (3) target share  t_i = capacity_ratio_i * max(1 - L_i, headroom_floor), normalized over healthy backends
+  -> (4) bound shares into [min_weight, max_weight] (sum stays 1)
+  -> (5) EMA smoothing           s_i = alpha*t_i + (1-alpha)*s_i
+  -> (6) step limit              w_i = w_i_prev + clamp(s_i - w_i_prev, -step, +step)
+  -> (7) hysteresis              publish only if max_i |w_i - w_i_prev| >= deadband
+```
+
+**Load score.** Weighted mean of the available signals, renormalized over those that exist:
+
+| Signal | Source feature | Default weight |
+| :--- | :--- | :---: |
+| Active connections | `active_connections_normalized` | 0.30 |
+| p95 latency | `p95_latency_normalized` | 0.30 |
+| Error rate | `error_rate` | 0.20 |
+| CPU | `cpu_utilization` (skipped if `cpu_is_missing`) | 0.10 |
+| Memory | `memory_utilization` (skipped if `memory_is_missing`) | 0.10 |
+
+A missing CPU/memory reading is **excluded** from the score; it never silently becomes zero load. CPU and memory are host-level, so they are identical across backends on one host and do not discriminate between them (limitation documented in Phase 1); they are kept at low weight.
+
+**Capacity awareness.** `capacity_ratio` (static weight share) is the multiplier, so with equal load the controller reproduces the static capacity shares, and with unequal load it shifts traffic away from the loaded backend proportionally.
+
+**Bounding.** Shares are scaled (bisection on a scale factor) so that after clamping to `[min_weight, max_weight]` they still sum to 1. If the bounds are infeasible for the number of healthy backends (e.g., one healthy backend) they are relaxed. A healthy backend can therefore never be starved by the controller.
+
+### 7.4 Stability Mechanisms
+| Mechanism | Default | Purpose |
+| :--- | :---: | :--- |
+| EMA smoothing (`ema_alpha`) | 0.3 | Suppress window-to-window noise (one of the Phase 2 alphas 0.1/0.3/0.5) |
+| Max step per window (`max_step_per_window`) | 0.10 | Hard bound on weight change per decision (verified by test) |
+| Weight bounds | 0.05 – 0.80 | No starvation, no monopolization |
+| Hysteresis deadband (`deadband`) | 0.02 | Small differences do not republish the policy |
+| Headroom floor (`headroom_floor`) | 0.05 | A saturated backend keeps a minimal share rather than zero |
+
+* **Initial weights** are the static capacity shares; the controller moves away from them gradually.
+* **Unhealthy backends** are excluded from scoring and normalization and keep their last weight frozen. On recovery their EMA state is reset and the step limit brings them back gradually. SWRR skips them through `IsAlive()` regardless of weight.
+* **Safe-policy retain.** If the state is stale, invalid, or too small (`SafePolicyRetainRecommended`), the controller holds the current weights and records the reason.
+* Weights are *relative* shares; they need not sum to 1 once some backends are down.
+
+### 7.5 Shadow Mode
+`main.go` always runs the controller every 10 s. Its decisions are published to the request path **only while the Adaptive-Weighted-Round-Robin strategy is active** (`PolicyStore.PublishWeightsIf`). Otherwise it runs in *shadow mode*: its EMA state stays warm and its decisions are inspectable at `GET /api/controller` (`"shadow": true`), but nothing changes. This lets the baseline be compared against RR/LC/SWRR on identical telemetry.
+
+### 7.6 Adaptive Weighted Round Robin Strategy
+`strategy.AdaptiveWeightedRoundRobin` is Nginx-style smooth WRR (shared core with the static SWRR) whose weights come from the **current immutable policy snapshot**, read once per selection:
+* share → integer weight `round(share * 1000)`, minimum 1.
+* A backend missing from the snapshot (e.g., just added) falls back to its static capacity share.
+* Static SWRR behavior is unchanged (refactored onto the shared core; all previous tests pass).
+
+### 7.7 Verification
+`controller/rule_based_test.go` and `strategy/adaptive_weighted_round_robin_test.go` cover: idle/balanced state stays static; weight shifts away from a loaded backend; max step per window respected over many windows; hysteresis; unhealthy freeze and recovery reset; stale/invalid/empty/nil state holds; single healthy backend; missing CPU excluded; share bounding sums to 1; defensive copies; exact distribution under dynamic weights, health exclusion and recovery, zero-weight non-starvation, and mid-stream weight swap.
+
+> A bug found while testing: the first bounding implementation clamped low and high in one pass and could leave shares summing to 0.9 (e.g. `[0.97, 0.02, 0.01]` → `[0.8, 0.05, 0.05]`). It was replaced by the monotone bisection described above.
+
+### 7.8 Important Conclusions
+1. The baseline is fully explainable: every weight can be traced to load scores, EMA, and the step limit via `GET /api/controller`.
+2. Hysteresis plus a step limit make the policy change rarely and smoothly, which keeps its overhead and the SWRR state disturbance low.
+3. Because the controller and the future agent share the State v1 / Policy interfaces, any improvement the agent shows can be attributed to learning rather than to different inputs.
+
+---
+
+## 8. Phase 6 — Actions and Policy Semantics
+
+### 8.1 Objectives
+1. The agent chooses a **strategy**, not a backend per request.
+2. Keep the action space small, fixed, and always valid under the current configuration.
+3. Publish a complete **immutable** policy snapshot that the request path reads atomically.
+
+### 8.2 Action Space (`policy` package)
+
+| Action ID | Strategy | Valid when | Notes |
+| :---: | :--- | :--- | :--- |
+| 0 | Round-Robin | ≥ 1 backend | Homogeneous backends, short stateless requests |
+| 1 | Least-Connections | ≥ 1 backend | Active requests proxy remaining work |
+| 2 | Static SWRR | all configured weights > 0 and finite | Uses configured capacity weights, normalized and validated |
+| 3 | Consistent-Hash | **session affinity is required** (`LB_AFFINITY_REQUIRED=1`) | Optimizes affinity, not even distribution |
+| 4 | Rule-based Adaptive | rule-based controller is running | The Phase 5 non-AI baseline |
+
+Action IDs are stable and part of the agent contract. `policy.Validate`, `policy.Describe` and `policy.ActionMask` expose validity (with reasons) so an agent can use an action mask and never select an invalid action.
+
+> **Consistent Hash caveat.** CH is not comparable to RR/LC on every workload: it optimizes affinity/cache locality. It is masked out by default, and results for CH must be reported separately on affinity/cache-sensitive scenarios. The existing manual `POST /api/strategy` (dashboard) is an operator override and is not restricted; the policy API and the agent are.
+
+### 8.3 Policy Object
+```go
+type Policy struct {
+    Strategy   StrategyType
+    Weights    []float64   // relative shares, aligned with BackendIDs
+    BackendIDs []string    // stable sorted order (same as State v1)
+    Version    uint64      // strictly increasing
+    CreatedAt  time.Time
+}
+```
+`BackendIDs` was added to the suggested struct so weights can never be misaligned if the backend set changes.
+
+### 8.4 Immutability and Atomic Publication
+* `policy.Store` holds `atomic.Pointer[Policy]`. Request-path readers call `Current()` (lock-free); writers are serialized by a mutex so versions are strictly increasing.
+* `Publish` validates (`len(ids)==len(weights)`, finite, non-negative, no duplicate IDs) and **copies** ids and weights into a new object with a prebuilt lookup index. Nothing is mutated after publication; a caller mutating its slices afterwards cannot affect a published policy (tested).
+* `PublishWeightsIf(strategy, …)` installs weights only if the active strategy is still that strategy, so a slow controller can never overwrite a policy chosen in the meantime.
+* Every strategy switch (`SetStrategy`) publishes a policy: Static SWRR carries normalized capacity weights, Adaptive carries the controller's current weights, other strategies carry none. The policy version (`vN`) is surfaced as `controller.policy_version` in `/api/metrics`.
+* If a strategy outside the action space is installed (e.g. a custom test strategy), the previous policy is kept instead of failing the switch.
+
+### 8.5 Endpoints
+| Endpoint | Description |
+| :--- | :--- |
+| `GET /api/policy` | Active policy snapshot, all 5 actions with validity/reason, and the `action_mask` |
+| `POST /api/policy` `{"action": 0..4}` | Validates, then activates the action; `400` with the reason if invalid |
+| `GET /api/controller` | Controller config, last decision (scores, targets, smoothed, weights, hold reason), active policy, `shadow` flag |
+
+### 8.6 Verification
+`policy/policy_test.go` (stable IDs, validation matrix, mask, normalization, copy/immutability, invalid weights rejected without bumping the version, conditional publish, concurrent read/write never sees a torn snapshot) and `policy_integration_test.go` (policy published on switch, action validation, dynamic weights reaching the request path, health exclusion independent of policy, policy version in metrics, HTTP API, concurrent publish + selection).
+
+A live smoke test confirmed: `GET /api/policy` returns the mask `[true,true,true,false,true]`; `POST {"action":3}` → 400 with the reason; `POST {"action":4}` → 200 and the strategy switches; with too few samples the controller holds with reason `safe-policy retain: insufficient samples`.
+
+### 8.7 Environment Note on the Race Detector
+`go test -race ./...` still cannot run on this machine (32-bit MinGW, see `BASELINE.md`). Phase 5/6 concurrency is covered by parallel tests (`TestConcurrentReadWrite`, `TestConcurrentPolicyUpdatesWhileSelecting`); they should be re-run under `-race` on a 64-bit GCC toolchain.
+
+### 8.8 Important Conclusions
+1. A fixed 5-action space with a validity mask removes an entire class of invalid agent behaviour.
+2. Immutable copy-on-publish snapshots make the hot path lock-free for policy reads and eliminate concurrent mutation of weights.
+3. Keeping CH behind an explicit affinity requirement prevents the agent from "winning" on a metric it does not optimize.
+
+---
+
+## 9. Architectural Summary & Best Practices
 
 ```mermaid
 flowchart LR
@@ -386,6 +531,17 @@ flowchart LR
     Collector --> StateEngine
     StateEngine --> API
     StateEngine --> Vector
+
+    subgraph Control["Phase 5-6: Controller and Policy"]
+        Rule["Rule-Based Controller (EMA, step limit, hysteresis)"]
+        Store["Policy Store (immutable snapshots, atomic read)"]
+        Actions["Action Space 0-4 + validity mask"]
+    end
+
+    Vector --> Rule
+    Rule --> Store
+    Actions --> Store
+    Store --> LB
 ```
 
 ### Engineering Best Practices Implemented
@@ -398,11 +554,12 @@ flowchart LR
 
 ---
 
-## 8. Next Steps & Road Ahead
+## 10. Next Steps & Road Ahead
 
-* **Phase 5 — Adaptive Controller & Policy Engine**:
-  * Implement heuristic and machine-learning controllers consuming `FlattenedVector` from `GET /api/state`.
-  * Trigger dynamic strategy switching based on real-time load, backend latency divergence, and error bursts.
-  * Honor `safe_policy_retain_recommended` to freeze strategy transitions whenever telemetry is stale or invalid.
-* **Phase 6 — Controlled Fault Injection & Stress Evaluation**:
-  * Evaluate adaptive controller behavior against static baselines under traffic surges, backend degradation, and network partitions.
+* **Phase 7 - Learned Agent**:
+  * Consume `FlattenedVector` from `GET /api/state` and the `action_mask` from `GET /api/policy`; act via `POST /api/policy`.
+  * Honor `safe_policy_retain_recommended` and avoid aggressive exploration on stale or invalid telemetry.
+  * Compare against RR, LC, static SWRR and the Phase 5 rule-based baseline (action 4); report Consistent Hash separately on affinity workloads.
+* **Controlled Fault Injection & Stress Evaluation**:
+  * Evaluate against static baselines under traffic surges, backend degradation, and network partitions.
+* **Open items**: re-run the suite under `-race` on a 64-bit toolchain; per-backend (process-level) CPU/memory so the CPU/memory score components can discriminate between backends.

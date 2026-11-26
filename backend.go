@@ -1,7 +1,9 @@
 package main
 
 import (
+	"adaptive-load/controller"
 	"adaptive-load/metrics"
+	"adaptive-load/policy"
 	"adaptive-load/strategy"
 	"fmt"
 	"log"
@@ -9,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,6 +86,12 @@ func (b *Backend) SetWeight(weight int) {
 	b.mux.Unlock()
 }
 
+// GetName returns the stable backend name used as the backend ID in metrics,
+// the State v1 vector, and policies.
+func (b *Backend) GetName() string {
+	return b.Name
+}
+
 // GetID returns the string identifier of the backend (URL string) for consistent hashing
 func (b *Backend) GetID() string {
 	if b.URL == nil {
@@ -97,6 +106,11 @@ type ServerPool struct {
 	strategy  strategy.SelectionStrategy[*Backend]
 	collector *metrics.MetricsCollector
 	mux       sync.RWMutex
+
+	// Phase 6: immutable policy snapshots read atomically by strategies.
+	policies         *policy.Store
+	affinityRequired bool
+	ctrl             *controller.Controller // Phase 5 rule-based baseline (optional)
 }
 
 // NewServerPool creates a new ServerPool with the specified SelectionStrategy.
@@ -107,6 +121,7 @@ func NewServerPool(strat strategy.SelectionStrategy[*Backend]) *ServerPool {
 	}
 	return &ServerPool{
 		strategy: strat,
+		policies: policy.NewStore(policy.StrategyType(strat.Name())),
 	}
 }
 
@@ -124,32 +139,153 @@ func (s *ServerPool) GetCollector() *metrics.MetricsCollector {
 	return s.collector
 }
 
-// SetStrategy updates the selection strategy dynamically
+// SetStrategy updates the selection strategy dynamically and publishes the
+// matching immutable policy snapshot.
 func (s *ServerPool) SetStrategy(strat strategy.SelectionStrategy[*Backend]) {
-	if strat != nil {
-		start := time.Now()
-		s.mux.Lock()
-		s.strategy = strat
-		col := s.collector
-		s.mux.Unlock()
+	if strat == nil {
+		return
+	}
+	start := time.Now()
+	s.mux.Lock()
+	s.strategy = strat
+	col := s.collector
+	ver := s.publishPolicyLocked(policy.StrategyType(strat.Name()))
+	s.mux.Unlock()
 
-		if col != nil {
-			col.RecordStrategySwitch(strat.Name(), time.Since(start))
+	if col != nil {
+		col.RecordStrategySwitch(strat.Name(), time.Since(start))
+		col.SetPolicyVersion(ver)
+	}
+}
+
+// sortedBackendsLocked returns the backends in stable sorted-name order, the same
+// order as the State v1 vector. Caller must hold s.mux.
+func (s *ServerPool) sortedBackendsLocked() []*Backend {
+	bs := append([]*Backend(nil), s.backends...)
+	sort.Slice(bs, func(i, j int) bool { return bs[i].Name < bs[j].Name })
+	return bs
+}
+
+// publishPolicyLocked publishes the policy for strategy st, with weights where
+// the strategy has them. Caller must hold s.mux. Returns the version string.
+func (s *ServerPool) publishPolicyLocked(st policy.StrategyType) string {
+	var ids []string
+	var weights []float64
+	switch st {
+	case policy.StaticSWRR:
+		bs := s.sortedBackendsLocked()
+		infos := make([]policy.BackendInfo, len(bs))
+		for i, b := range bs {
+			infos[i] = policy.BackendInfo{ID: b.Name, StaticWeight: b.GetWeight()}
+		}
+		if w, err := policy.NormalizeStaticWeights(infos); err == nil {
+			weights = w
+			for _, in := range infos {
+				ids = append(ids, in.ID)
+			}
+		}
+	case policy.AdaptiveSWRR:
+		if s.ctrl != nil {
+			ids, weights = s.ctrl.CurrentWeights()
 		}
 	}
+	p, err := s.policies.Publish(st, ids, weights)
+	if err != nil {
+		// Weights were unusable: publish the strategy without weights rather than failing the switch.
+		if p, err = s.policies.Publish(st, nil, nil); err != nil {
+			// Strategy outside the action space (e.g. a custom strategy): keep the prior policy.
+			p = s.policies.Current()
+		}
+	}
+	return policyVersionString(p)
+}
+
+func policyVersionString(p *policy.Policy) string {
+	return fmt.Sprintf("v%d", p.Version)
+}
+
+// Policies returns the policy store (lock-free reads via Current()).
+func (s *ServerPool) Policies() *policy.Store { return s.policies }
+
+// SetAffinityRequired declares whether session affinity is a system requirement
+// (the precondition for the Consistent-Hash action).
+func (s *ServerPool) SetAffinityRequired(v bool) {
+	s.mux.Lock()
+	s.affinityRequired = v
+	s.mux.Unlock()
+}
+
+// SetController attaches the rule-based controller, making the adaptive action available.
+func (s *ServerPool) SetController(c *controller.Controller) {
+	s.mux.Lock()
+	s.ctrl = c
+	s.mux.Unlock()
+}
+
+// GetController returns the attached rule-based controller, if any.
+func (s *ServerPool) GetController() *controller.Controller {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return s.ctrl
+}
+
+// Constraints describes the current configuration that actions must be valid under.
+func (s *ServerPool) Constraints() policy.Constraints {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	bs := s.sortedBackendsLocked()
+	infos := make([]policy.BackendInfo, len(bs))
+	for i, b := range bs {
+		infos[i] = policy.BackendInfo{ID: b.Name, StaticWeight: b.GetWeight()}
+	}
+	return policy.Constraints{Backends: infos, AffinityRequired: s.affinityRequired, AdaptiveAvailable: s.ctrl != nil}
+}
+
+// ValidateAction checks an action against the current backend configuration.
+func (s *ServerPool) ValidateAction(a policy.ActionID) error {
+	return policy.Validate(a, s.Constraints())
+}
+
+// ApplyAction validates the action and, if valid, activates its strategy.
+func (s *ServerPool) ApplyAction(a policy.ActionID) error {
+	if err := s.ValidateAction(a); err != nil {
+		return err
+	}
+	st, _ := a.Strategy()
+	return s.SetStrategyByName(string(st))
+}
+
+// PublishAdaptiveWeights installs new dynamic weights, but only while the
+// adaptive strategy is active. It reports whether the weights were applied.
+func (s *ServerPool) PublishAdaptiveWeights(ids []string, weights []float64) bool {
+	s.mux.RLock()
+	col := s.collector
+	s.mux.RUnlock()
+	p, ok, err := s.policies.PublishWeightsIf(policy.AdaptiveSWRR, ids, weights)
+	if err != nil || !ok {
+		return false
+	}
+	if col != nil {
+		col.SetPolicyVersion(policyVersionString(p))
+	}
+	return true
 }
 
 // SetStrategyByName updates the active strategy using its string identifier
 func (s *ServerPool) SetStrategyByName(name string) error {
-	switch name {
-	case "Round-Robin":
+	switch policy.StrategyType(name) {
+	case policy.RoundRobin:
 		s.SetStrategy(strategy.NewRoundRobin[*Backend]())
-	case "Least-Connections":
+	case policy.LeastConnections:
 		s.SetStrategy(strategy.NewLeastConnections[*Backend]())
-	case "Smooth-Weighted-Round-Robin":
+	case policy.StaticSWRR:
 		s.SetStrategy(strategy.NewSmoothWeightedRoundRobin[*Backend]())
-	case "Consistent-Hash":
+	case policy.ConsistentHash:
 		s.SetStrategy(strategy.NewConsistentHash[*Backend](100))
+	case policy.AdaptiveSWRR:
+		s.SetStrategy(strategy.NewAdaptiveWeightedRoundRobin[*Backend](func() strategy.WeightLookup {
+			return s.policies.Current()
+		}))
 	default:
 		return fmt.Errorf("unknown strategy: %s", name)
 	}

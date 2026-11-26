@@ -2,6 +2,7 @@ package main
 
 import (
 	"adaptive-load/metrics"
+	"adaptive-load/policy"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -273,6 +274,45 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(col.CollectSnapshot())
+
+	case r.URL.Path == "/api/policy" && r.Method == http.MethodGet:
+		cons := pool.Constraints()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"policy":      pool.Policies().Current(),
+			"actions":     policy.Describe(cons),
+			"action_mask": policy.ActionMask(cons),
+		})
+
+	case r.URL.Path == "/api/policy" && r.Method == http.MethodPost:
+		var body struct {
+			Action *int `json:"action"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Action == nil {
+			http.Error(w, `invalid request body: expected {"action": <0..4>}`, http.StatusBadRequest)
+			return
+		}
+		if err := pool.ApplyAction(policy.ActionID(*body.Action)); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		log.Printf("[LoadBalancer] Applied action %d -> policy v%d", *body.Action, pool.Policies().Current().Version)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "policy": pool.Policies().Current()})
+
+	case r.URL.Path == "/api/controller" && r.Method == http.MethodGet:
+		ctrl := pool.GetController()
+		if ctrl == nil {
+			http.Error(w, `{"error":"rule-based controller not configured"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"config": ctrl.Config(),
+			"last":   ctrl.Last(),
+			"policy": pool.Policies().Current(),
+			"shadow": pool.Policies().Current().Strategy != policy.AdaptiveSWRR,
+		})
 
 	case r.URL.Path == "/api/state" && r.Method == http.MethodGet:
 		col := pool.GetCollector()

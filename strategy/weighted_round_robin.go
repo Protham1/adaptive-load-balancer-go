@@ -4,33 +4,27 @@ import (
 	"sync"
 )
 
-// SmoothWeightedRoundRobin implements Nginx's smooth weighted round-robin algorithm
-type SmoothWeightedRoundRobin[T WeightedPeer] struct {
+// swrrCore holds the smooth weighted round-robin state shared by the static and
+// adaptive variants.
+type swrrCore struct {
 	mu             sync.Mutex
 	currentWeights map[any]int
 }
 
-// NewSmoothWeightedRoundRobin creates a new instance of SmoothWeightedRoundRobin
-func NewSmoothWeightedRoundRobin[T WeightedPeer]() *SmoothWeightedRoundRobin[T] {
-	return &SmoothWeightedRoundRobin[T]{
-		currentWeights: make(map[any]int),
-	}
+func newSWRRCore() *swrrCore {
+	return &swrrCore{currentWeights: make(map[any]int)}
 }
 
-// Name returns the strategy identifier
-func (s *SmoothWeightedRoundRobin[T]) Name() string {
-	return "Smooth-Weighted-Round-Robin"
-}
-
-// SelectNextBackend selects the next peer according to Nginx smooth weighted round-robin
-func (s *SmoothWeightedRoundRobin[T]) SelectNextBackend(peers []T) T {
+// swrrSelect implements Nginx's smooth weighted round-robin. weightOf must
+// return a positive integer weight for each alive peer.
+func swrrSelect[T Peer](c *swrrCore, peers []T, weightOf func(T) int) T {
 	var zero T
 	if len(peers) == 0 {
 		return zero
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	var totalWeight int
 	var bestPeer T
@@ -42,9 +36,9 @@ func (s *SmoothWeightedRoundRobin[T]) SelectNextBackend(peers []T) T {
 	for _, p := range peers {
 		activeSet[any(p)] = struct{}{}
 	}
-	for k := range s.currentWeights {
+	for k := range c.currentWeights {
 		if _, exists := activeSet[k]; !exists {
-			delete(s.currentWeights, k)
+			delete(c.currentWeights, k)
 		}
 	}
 
@@ -53,14 +47,14 @@ func (s *SmoothWeightedRoundRobin[T]) SelectNextBackend(peers []T) T {
 			continue
 		}
 
-		w := p.GetWeight()
+		w := weightOf(p)
 		if w <= 0 {
 			w = 1 // default minimum weight
 		}
 
 		key := any(p)
-		curr := s.currentWeights[key] + w
-		s.currentWeights[key] = curr
+		curr := c.currentWeights[key] + w
+		c.currentWeights[key] = curr
 		totalWeight += w
 
 		if !found || curr > bestCurrentWeight {
@@ -75,7 +69,28 @@ func (s *SmoothWeightedRoundRobin[T]) SelectNextBackend(peers []T) T {
 	}
 
 	// Decrement total weight from selected peer's current weight
-	s.currentWeights[any(bestPeer)] -= totalWeight
+	c.currentWeights[any(bestPeer)] -= totalWeight
 
 	return bestPeer
+}
+
+// SmoothWeightedRoundRobin implements Nginx's smooth weighted round-robin algorithm
+// using the statically configured capacity weights.
+type SmoothWeightedRoundRobin[T WeightedPeer] struct {
+	core *swrrCore
+}
+
+// NewSmoothWeightedRoundRobin creates a new instance of SmoothWeightedRoundRobin
+func NewSmoothWeightedRoundRobin[T WeightedPeer]() *SmoothWeightedRoundRobin[T] {
+	return &SmoothWeightedRoundRobin[T]{core: newSWRRCore()}
+}
+
+// Name returns the strategy identifier
+func (s *SmoothWeightedRoundRobin[T]) Name() string {
+	return "Smooth-Weighted-Round-Robin"
+}
+
+// SelectNextBackend selects the next peer according to Nginx smooth weighted round-robin
+func (s *SmoothWeightedRoundRobin[T]) SelectNextBackend(peers []T) T {
+	return swrrSelect(s.core, peers, func(p T) int { return p.GetWeight() })
 }

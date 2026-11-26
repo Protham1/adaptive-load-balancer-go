@@ -1,11 +1,14 @@
 package main
 
 import (
+	"adaptive-load/controller"
 	"adaptive-load/metrics"
 	"adaptive-load/strategy"
+	"context"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 )
 
@@ -51,6 +54,15 @@ func main() {
 		metricsCollector.RegisterBackend(cfg.Name, u.String(), cfg.Weight, 4, 1024*1024*512, 100)
 		log.Printf("Configured Backend: %s (%s, Weight: %d)", cfg.Name, u.String(), cfg.Weight)
 	}
+
+	// Phase 5: rule-based adaptive baseline. It runs in shadow mode until the
+	// Adaptive-Weighted-Round-Robin action is selected (POST /api/policy {"action":4}).
+	ruleController := controller.New(controller.DefaultConfig())
+	serverPool.SetController(ruleController)
+	serverPool.SetAffinityRequired(os.Getenv("LB_AFFINITY_REQUIRED") == "1")
+	go ruleController.Run(context.Background(), 10*time.Second,
+		func() *metrics.StateRepresentation { return metricsCollector.GetStateRepresentation() },
+		serverPool.PublishAdaptiveWeights)
 
 	// 3. Start Periodic Background Health Check
 	go func() {
