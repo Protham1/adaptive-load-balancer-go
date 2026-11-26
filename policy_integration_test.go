@@ -149,8 +149,12 @@ func TestPolicyAPI(t *testing.T) {
 	if w := post(`{}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("missing action should be 400, got %d", w.Code)
 	}
-	if w := post(`{"action":4}`); w.Code != http.StatusOK {
-		t.Fatalf("adaptive should be 200, got %d: %s", w.Code, w.Body.String())
+	w4 := post(`{"action":4,"decision_id":"d-000001"}`)
+	if w4.Code != http.StatusOK {
+		t.Fatalf("adaptive should be 200, got %d: %s", w4.Code, w4.Body.String())
+	}
+	if !strings.Contains(w4.Body.String(), `"decision_id":"d-000001"`) {
+		t.Fatalf("decision_id must be echoed: %s", w4.Body.String())
 	}
 	if pool.GetStrategy().Name() != "Adaptive-Weighted-Round-Robin" {
 		t.Fatal("strategy not switched")

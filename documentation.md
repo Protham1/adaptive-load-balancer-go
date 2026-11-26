@@ -501,7 +501,187 @@ A live smoke test confirmed: `GET /api/policy` returns the mask `[true,true,true
 
 ---
 
-## 9. Architectural Summary & Best Practices
+## 9. Phase 7 — Reward Function
+
+Implemented in [`ai/reward.py`](./ai/reward.py); verified by `ai/tests/test_reward.py` (hand-computed examples).
+
+### 9.1 Formulation
+```text
+R = wT·T_norm − wL·L95_norm − wE·E_norm − wV·V_norm        wT + wL + wE + wV = 1.0
+```
+
+| Term | Definition (over the exact evaluation window) | Range |
+| :--- | :--- | :---: |
+| `T_norm` | completed requests per second ÷ `ref_throughput_rps` (100), clipped | [0,1] |
+| `L95_norm` | window p95 latency ÷ 500 ms (same scale as State v1), clipped | [0,1] |
+| `E_norm` | errors ÷ completed requests | [0,1] |
+| `V_norm` | `(1 − J) / (1 − 1/n)` where `J` is Jain's index | [0,1] |
+
+Default weights: **wT = 0.25, wL = 0.35, wE = 0.25, wV = 0.15**. Normal reward range is `[−0.75, +0.25]`. These weights were chosen a priori (tail latency and errors weigh most, throughput least so that an overloaded system cannot "buy" reward with throughput). They have **not** been tuned on a real development workload yet; `ref_throughput_rps` must be set from the measured peak of that workload before final runs, then both held fixed.
+
+### 9.2 Jain's fairness index and what `x` is
+`J = (Σx)² / (n·Σx²)`, with `x_i = (requests_i / window seconds) / declared_capacity_i` — the **capacity-adjusted service rate**, over backends healthy at both ends of the window. Equal request counts are therefore *not* "fair" on a 3:2:1 pool; load proportional to declared capacity is (hand-computed test: equal counts on 3:2:1 gives `J = 0.8231`, `V = 0.2653`). `V = 0` when fewer than two backends qualify. Limitation: fairness is measured against *declared* capacity, so a backend that is secretly degraded still counts as "fairly loaded" when it receives its declared share; latency and errors are what catch that.
+
+### 9.3 Safeguards (checklist from the plan)
+| Safeguard | Implementation |
+| :--- | :--- |
+| Normalize terms to comparable ranges | every term clipped to [0,1] before weighting |
+| Hard penalty for severe errors / backend failure | error rate ≥ **0.10** or **no healthy backend** → reward = **−1.0** (`safety_penalty`), strictly below the worst possible normal reward (−0.75), so throughput can never outbid it |
+| Do not reward throughput alone | throughput carries the smallest weight; latency and errors are penalized more |
+| No unexplained double counting | `T` counts *completed* requests (errors included) so a failing request is penalized once, via `E`. Latency and imbalance are correlated under saturation; both are kept because they measure different things (tail experience vs. fairness) and the sensitivity analysis quantifies the effect |
+| Log every component | `RewardBreakdown` carries `raw`, `normalized`, `weights`, signed `contributions`, `override`, and `reason`; every `outcome` record in the decision log contains all of it |
+| Window too small | fewer than 20 requests → `reward = None`, window **abandoned**, never treated as 0 |
+| Counter reset / time travel | `outcome_from_samples` raises → window abandoned |
+
+### 9.4 Sensitivity analysis
+`sensitivity_analysis()` recomputes every action's mean reward on *identical logged outcomes* under perturbed weights (each weight ±25%, plus 200 seeded joint random perturbations, renormalized) and reports (a) the fraction of configurations keeping the same best action and (b) pairwise-order agreement. If either falls below 0.9 the result carries an explicit `limitation` message.
+
+Result on the simulator (fixed action per scenario, 5 seeds):
+
+| Scenario | Best action unchanged | Pairwise order agreement | Stable |
+| :--- | :---: | :---: | :---: |
+| balanced | 1.00 | 0.83 | no |
+| cpu_imbalance | 1.00 | 0.99 | yes |
+| latency_degradation | 1.00 | 1.00 | yes |
+| high_concurrency | 1.00 | 0.83 | no |
+| traffic_spike | 1.00 | 0.83 | no |
+| backend_failure | 1.00 | 0.95 | yes |
+| **pooled** | **1.00** | **1.00** | **yes** |
+
+The best action never changed. The three "unstable" scenarios are those where several actions are essentially tied (e.g. LC, static SWRR and rule-based all score −0.083 under balanced load), so their *relative order* flips under tiny perturbations. This is reported as a limitation: **differences between tied actions are not meaningful**; only the separation from clearly worse actions (RR under degradation or saturation) is robust.
+
+---
+
+## 10. Phase 8 — Python Contextual Bandit
+
+Package [`ai/`](./ai) (Python 3.13, numpy only; no LLM, no API keys, no external services).
+
+### 10.1 Layout
+```text
+ai/
+  schemas.py      strict parsers for /api/state, /api/metrics, /api/policy (SchemaError on bad payloads)
+  state.py        state validation (version, shape, finite, [0,1], stale, retain flag, backend set) + context builder
+  actions.py      action IDs 0-4 (mirror of Go), mask helpers, safe fallback
+  reward.py       Phase 7
+  bandit.py       learners: LinUCB, LinearEpsilonGreedy (contextual); MeanEpsilonGreedy, Random, Fixed (baselines)
+  controller.py   online loop, decision IDs, evaluation windows, shadow/live modes
+  persistence.py  atomic model save/load with compatibility checks, JSONL decision log
+  client.py       HTTP Environment for the Go service
+  simulator.py, experiments.py, promotion_gate.py   Phase 9
+  cli.py          python -m ai.cli
+  tests/          71 tests
+```
+
+### 10.2 Learners
+| Learner | Contextual? | Notes |
+| :--- | :---: | :--- |
+| **LinUCB** | **yes** | disjoint ridge model per action, `θ_a·x + α·√(xᵀA_a⁻¹x)`; inverses maintained by Sherman–Morrison |
+| **LinearEpsilonGreedy** | **yes** | per-action ridge regression on the state, ε-greedy on predictions |
+| MeanEpsilonGreedy | **no** | plain per-action average; ignores the state — labelled non-contextual everywhere and used only as a baseline |
+| Random / Fixed | no | baselines (always-RR, always-LC, …) |
+
+All learners select only among **allowed** actions (the Go `action_mask`) and raise `NoAllowedAction` (→ the controller holds) when none exists. Unit tests confirm: masked actions are never returned; the contextual learners learn a task whose best action flips with the context while the mean bandit cannot (reward ≈ 0.5); Sherman–Morrison equals the direct inverse.
+
+**Context.** `compact` (default): 4 global features + 10 aggregates over backends (min/mean healthy, mean/max CPU, mean/max connections, mean/max p95, max error rate, RPS std) + bias = 15 dims, independent of the number of backends. `full`: the whole State v1 vector + bias (29 dims for 3 backends). Compact exists because a few hundred decisions cannot fit 5×29 parameters well.
+
+### 10.3 Online loop and decision IDs
+One decision = one evaluation window (default settle 10 s + measure 20 s):
+1. read and **validate** state `S_t` (stale/invalid/low-sample ⇒ **hold**: retain the policy, no exploration, no learning);
+2. select an allowed action `A_t` with decision ID `<run>-dNNNNNN`;
+3. live mode: `POST /api/policy {"action":A_t,"decision_id":…}` (the Go service echoes and logs the ID); shadow mode: record only;
+4. **settle** for ≥ one Go metrics window so p95 reflects only the new policy, then take the start snapshot (skipped when the action equals the active policy);
+5. after the measurement window, compute `R_t` from **counter deltas** between the two snapshots (throughput, errors, per-backend rates) and the p95 at the end;
+6. update the learner with `(S_t, A_t, R_t)`; 7. atomically persist the model and append the decision/outcome records; 8. repeat.
+
+**Reward attribution.** A window is credited only if exposure was clean: the active strategy stayed `A_t` **and** the service's `switch_count` equals the value expected after our own switch. If anyone changes the policy mid-window, telemetry goes stale/invalid, counters reset, or the service is unreachable, the window is **abandoned** (logged with the reason) and the learner is **not** updated. After a window that triggered the safety override, the next decision is a forced conservative fallback (static SWRR, else RR).
+
+### 10.4 Persistence
+`save_model` writes JSON atomically (temp file + `fsync` + rename) after every update with metadata (context mode, dimension, state version, backend IDs). `load_model` **refuses** incompatible models (different algorithm, dimension, context mode, state version or backend set) instead of silently mixing them. A pending window is not persisted: after a restart it is simply not credited. Decision log: append-only JSONL with context, per-action scores, explored flag, policy version, and the full reward breakdown.
+
+### 10.5 Go-side change
+`POST /api/policy` accepts an optional `decision_id`, logs it, and echoes it in the response (tested).
+
+---
+
+## 11. Phase 9 — Offline Simulator and Safe Learning
+
+### 11.1 Simulator ([`ai/simulator.py`](./ai/simulator.py))
+A seeded queueing model emitting the **same JSON** as the Go service (`/api/state` State v1 vector with real feature names and normalization, `/api/metrics` counters, `/api/policy` with mask), so the controller's whole parse → validate → reward path runs offline. Three backends (weights 3:2:1, 20 rps per weight unit). Per backend: stable → `p95 = base + 3/(μ−λ)`; saturated (`λ ≥ 0.95μ`) → excess dropped as errors, p95 at the 2 s timeout; a failed backend errors 100% until health checks mark it down (10 s lag).
+
+Strategy behavior is **assumed**: RR splits equally; LC follows true current capacity but is *attracted* to an undetected failed backend; static SWRR follows declared weights; CH uses a fixed random skew; the rule-based strategy follows declared weights × headroom × (1 − error EMA) from lagged EMAs.
+
+> **Limitation (important).** This is a model, not measurement. A recording of one strategy does not reveal what another would have done in the same state, and the traffic-split/degradation rules above are assumptions. The results validate the *learning logic* and the safety behavior; they make **no counterfactual claim about the real system** and must be re-established on live traffic.
+
+Scenarios (deterministic given a seed): `balanced`, `cpu_imbalance` (noisy neighbour: Backend-1 at half capacity with pinned CPU), `latency_degradation` (Backend-2 slows 3×, capacity ×0.35), `high_concurrency` (~95% of capacity), `traffic_spike` (40→100 rps for 120 s), `backend_failure` (Backend-2 down 120 s). Note: the live Go service reports host-level CPU (identical for all backends), so the per-backend CPU imbalance in this scenario is not observable live until per-process metrics exist.
+
+### 11.2 Offline test sequence (all automated)
+| Requirement | Test |
+| :--- | :--- |
+| Deterministic states for each situation | every scenario emits valid State v1 at all times; same seed ⇒ identical output (`test_simulator_gate.py`) |
+| Invalid actions never returned | learners tested under random masks (unit + gate); masked actions rejected by simulator and Go |
+| Hand-computed rewards | `test_reward.py` (balanced: `R = 0.0725`; imbalance: `J = 0.8231`, `V = 0.2653`; overrides; small window) |
+| Seeded simulations, cumulative reward, action distribution | `ai/experiments.py` → [`results/cumulative_reward.png`](./ai/results/cumulative_reward.png), [`results/action_distribution.png`](./ai/results/action_distribution.png), [`results/experiments.json`](./ai/results/experiments.json) |
+| Model save/load and restart | persistence tests + gate check (A⁻¹ and b restored exactly, decision counter continues) |
+| Compare against random, always-RR, always-LC, rule-based | table below |
+
+### 11.3 Protocol
+Hyper-parameters were chosen on **development seeds** (1000–1004: LinUCB α ∈ {0.05, 0.1, 0.3, 1.0}, ε ∈ {0.05, 0.1, 0.2}) → **α = 0.05, ε = 0.05**, then frozen. Evaluation on **disjoint test seeds 0–19**. Each episode is a seeded random order of all six scenarios twice (12 × 360 s = 144 decisions); the learner keeps learning across scenario changes. Reward weights were held fixed.
+
+### 11.4 Results (simulator, mean reward per 30 s window, mean ± std over 20 test seeds; higher is better)
+
+| Policy | Mean reward | Std |
+| :--- | :---: | :---: |
+| always-LC | **−0.1385** | 0.0004 |
+| LinUCB (compact context) | −0.1434 | 0.0047 |
+| LinUCB (full context) | −0.1438 | 0.0052 |
+| Linear ε-greedy (compact) | −0.1517 | 0.0102 |
+| Mean ε-greedy (non-contextual) | −0.1671 | 0.0144 |
+| always-Rule-based adaptive | −0.1803 | 0.0036 |
+| always-Static SWRR | −0.2366 | 0.0018 |
+| random | −0.2723 | 0.0138 |
+| always-RR | −0.3864 | 0.0029 |
+
+Fixed-action mean reward per scenario (the reference table):
+
+| Scenario | RR | LC | Static SWRR | Rule-based |
+| :--- | :---: | :---: | :---: | :---: |
+| balanced | −0.244 | −0.083 | −0.083 | −0.083 |
+| cpu_imbalance | −0.230 | −0.192 | −0.198 | −0.187 |
+| latency_degradation | −0.760 | −0.191 | −0.773 | −0.183 |
+| high_concurrency | −0.550 | −0.101 | −0.101 | −0.522 |
+| traffic_spike | −0.352 | −0.096 | −0.096 | −0.096 |
+| backend_failure | −0.325 | −0.179 | −0.179 | −0.133 |
+
+**Honest reading of the results**
+* The contextual learners clearly beat random, always-RR, always-static-SWRR, always-rule-based, and the **non-contextual** bandit — the context-aware learner is better than the one that ignores the state (−0.143 vs −0.167).
+* **They do not beat the best fixed policy in this simulator**: always-LC is slightly better (−0.1385 vs −0.1434). In the model LC is best or tied-best in 3 of 6 scenarios (balanced, high_concurrency, traffic_spike) and within 0.01 of the best in 2 more (cpu_imbalance, latency_degradation, where the rule-based action leads by 0.005-0.008); only in backend_failure does another action win clearly (rule-based, +0.046). With one action so dominant there is little context-dependent value to capture, and exploration has a cost.
+* Therefore this experiment shows that the **learning machinery works and is safe**, not that AI beats the heuristics. Whether it adds value must be tested on real, heterogeneous traffic where no single strategy dominates. LinUCB spent roughly 50% of decisions on LC, 33% on the rule-based action and 16% on static SWRR; it effectively rediscovered "LC is good" and hedged.
+* Differences between LinUCB variants (compact vs full context) are within one standard deviation and should not be interpreted.
+
+### 11.5 Promotion gate ([`ai/promotion_gate.py`](./ai/promotion_gate.py))
+`python -m ai.promotion_gate` — the learner may only touch live traffic after **all** pass:
+
+| Check | What it verifies | Last result |
+| :--- | :--- | :---: |
+| `unit_tests` | the 71-test pytest suite | PASS |
+| `deterministic_replay` | same seed twice ⇒ identical decisions and rewards | PASS |
+| `invalid_stale_state` | stale / NaN / malformed telemetry ⇒ hold, **no action applied, no learner update**; restricted masks respected | PASS |
+| `simulated_failure` | backend-failure scenario: no invalid action; learner reward ≥ random on paired seeds (−0.165 vs −0.224; 11 override windows handled) | PASS |
+| `persistence_restart` | model restored exactly after restart | PASS |
+
+`python -m ai.cli` starts in **shadow mode** by default: it reads the live state, logs `recommend` records with `applied: false`, never calls `POST /api/policy`, and never updates the learner (a shadow-mode reward would be attributable to the policy that actually ran, not the recommendation). `--mode live` additionally requires `--allow-live` and re-runs the promotion gate first (exit code 3 on failure).
+
+**Live smoke test (shadow mode, real Go service).** The controller parsed the real `/api/state`, `/api/metrics` and `/api/policy` payloads, held while the window had only 5 samples ("insufficient samples … critical features missing"), then logged a recommendation (`applied: false`) and the active policy stayed Round-Robin.
+
+### 11.6 Not yet done / limitations
+* No reward-weight or `ref_throughput_rps` tuning on a real development workload; no live A/B comparison.
+* The simulator's strategy models are assumptions; CPU/memory are host-level on the live service.
+* The bandit assumes a stationary reward per (state, action) (no forgetting factor), and an action's reward includes switching transients that the settle period only partly removes.
+* `go test -race` still cannot run on this machine (32-bit MinGW); Python code has no shared mutable state across threads.
+
+---
+
+## 12. Architectural Summary & Best Practices
 
 ```mermaid
 flowchart LR
@@ -542,6 +722,20 @@ flowchart LR
     Rule --> Store
     Actions --> Store
     Store --> LB
+
+    subgraph AI["Phase 7-9: Python Learning Layer (ai/)"]
+        Validate["State validation + context"]
+        Bandit["Contextual Bandit (LinUCB / linear eps-greedy)"]
+        Reward["Reward R = wT*T - wL*L95 - wE*E - wV*V"]
+        Gate["Promotion gate + shadow mode"]
+    end
+
+    API --> Validate
+    Validate --> Bandit
+    Bandit -->|"POST /api/policy + decision_id"| Actions
+    Reward --> Bandit
+    API --> Reward
+    Gate -.-> Bandit
 ```
 
 ### Engineering Best Practices Implemented
@@ -554,12 +748,11 @@ flowchart LR
 
 ---
 
-## 10. Next Steps & Road Ahead
+## 13. Next Steps & Road Ahead
 
-* **Phase 7 - Learned Agent**:
-  * Consume `FlattenedVector` from `GET /api/state` and the `action_mask` from `GET /api/policy`; act via `POST /api/policy`.
-  * Honor `safe_policy_retain_recommended` and avoid aggressive exploration on stale or invalid telemetry.
-  * Compare against RR, LC, static SWRR and the Phase 5 rule-based baseline (action 4); report Consistent Hash separately on affinity workloads.
-* **Controlled Fault Injection & Stress Evaluation**:
-  * Evaluate against static baselines under traffic surges, backend degradation, and network partitions.
-* **Open items**: re-run the suite under `-race` on a 64-bit toolchain; per-backend (process-level) CPU/memory so the CPU/memory score components can discriminate between backends.
+* **Live shadow evaluation**: run `python -m ai.cli` in shadow mode against real, heterogeneous traffic and review the decision log before enabling `--mode live`.
+* **Reward calibration**: choose reward weights and `ref_throughput_rps` on a real development workload, then freeze them for final runs; repeat the sensitivity analysis on live outcomes.
+* **Per-backend resource metrics** (process-level CPU/memory) so the CPU/memory features discriminate between backends.
+* **Non-stationarity**: add a forgetting factor / sliding window to the bandit and test it on drifting workloads.
+* **Controlled fault injection & stress evaluation** on the live system against static baselines and the Phase 5 rule-based controller; report Consistent Hash separately on affinity workloads.
+* **Open item**: re-run the Go suite under `-race` on a 64-bit toolchain.

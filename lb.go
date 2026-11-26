@@ -286,7 +286,8 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 
 	case r.URL.Path == "/api/policy" && r.Method == http.MethodPost:
 		var body struct {
-			Action *int `json:"action"`
+			Action     *int   `json:"action"`
+			DecisionID string `json:"decision_id"` // optional: pairs the action with a learner decision
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Action == nil {
 			http.Error(w, `invalid request body: expected {"action": <0..4>}`, http.StatusBadRequest)
@@ -296,9 +297,9 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		log.Printf("[LoadBalancer] Applied action %d -> policy v%d", *body.Action, pool.Policies().Current().Version)
+		log.Printf("[LoadBalancer] Applied action %d (decision %q) -> policy v%d", *body.Action, body.DecisionID, pool.Policies().Current().Version)
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "policy": pool.Policies().Current()})
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "decision_id": body.DecisionID, "policy": pool.Policies().Current()})
 
 	case r.URL.Path == "/api/controller" && r.Method == http.MethodGet:
 		ctrl := pool.GetController()
