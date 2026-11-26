@@ -71,3 +71,30 @@ export function subscribeEvents(onMessage, onError) {
     es.close();
   };
 }
+
+// ---------------------------------------------------------------- research dashboard (Phase 18)
+async function getJSON(path) {
+  const res = await fetch(`${API_BASE}${path}`);
+  if (!res.ok) throw new Error(`${path}: ${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+async function postJSON(path, body) {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {}),
+  });
+  if (!res.ok) throw new Error(`${path}: ${res.status} ${(await res.text()).trim()}`);
+  return res.json();
+}
+
+export const fetchDashboard = () => getJSON('/dashboard');
+export const fetchHistory = (since = 0) => getJSON(`/history?since=${since}`);
+export const fetchEventLog = (since = 0) => getJSON(`/events/log?since=${since}`);
+export const fetchAgentStatus = () => getJSON('/agent');
+export const fetchLearner = (limit = 100) => getJSON(`/agent/learner?limit=${limit}`);
+/** kill=true disables AI decisions and applies the baseline; kill=false re-enables them. */
+export const setAIKill = (kill, baselineAction) =>
+  postJSON('/agent/kill', baselineAction == null ? { kill } : { kill, baseline_action: baselineAction });
+export const resetAgent = (archive = true) => postJSON('/agent/reset', { archive });

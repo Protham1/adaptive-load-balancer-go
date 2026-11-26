@@ -105,3 +105,35 @@ def build_context(s: StateSnapshot, mode: str = "compact") -> np.ndarray:
         pb[:, F_RPS].std(),
     ]
     return np.concatenate([v[:GLOBAL_FEATURES], np.asarray(agg, dtype=float), [1.0]])
+
+
+# ------------------------------------------------------------------ feature schema identity (Phase 19)
+_COMPACT_NAMES = [
+    "global.rps_normalized", "global.request_duration_p95_normalized", "global.long_request_ratio",
+    "global.global_error_rate", "agg.healthy_min", "agg.healthy_mean", "agg.cpu_mean", "agg.cpu_max",
+    "agg.conns_mean", "agg.conns_max", "agg.p95_mean", "agg.p95_max", "agg.error_max", "agg.rps_std", "bias",
+]
+_PER_BACKEND = ["healthy", "cpu_utilization", "memory_utilization", "active_connections_normalized",
+                "backend_rps_normalized", "p95_latency_normalized", "error_rate", "capacity_ratio"]
+
+
+def context_feature_names(mode: str, backend_ids) -> list:
+    """Ordered names of the learner's context features (including the bias term)."""
+    if mode == "compact":
+        return list(_COMPACT_NAMES)
+    if mode == "full":
+        names = _COMPACT_NAMES[:GLOBAL_FEATURES]
+        for b in backend_ids:
+            names += [f"backend[{b}].{f}" for f in _PER_BACKEND]
+        return names + ["bias"]
+    raise ValueError(f"unknown context mode {mode!r}")
+
+
+def feature_schema_hash(mode: str, backend_ids, state_version: str = EXPECTED_STATE_VERSION, extra: tuple = ()) -> str:
+    """Stable identity of the feature layout: a model is only valid for the schema it was trained on.
+    `extra` lists additional appended features (e.g. forecast features of the predictive layer)."""
+    import hashlib
+    import json
+    body = json.dumps({"state_version": state_version, "mode": mode,
+                       "names": context_feature_names(mode, backend_ids) + list(extra)}, sort_keys=True)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()[:16]

@@ -112,7 +112,15 @@ type ServerPool struct {
 	affinityRequired bool
 	ctrl             *controller.Controller // Phase 5 rule-based baseline (optional)
 	agentCtl         *AgentController       // Phase 10 AI decision loop (optional)
+	events           *EventLog              // Phase 18: bounded research event log
+	history          *History               // Phase 18: bounded time-series history
 }
+
+// Events returns the event log (never nil).
+func (s *ServerPool) Events() *EventLog { return s.events }
+
+// History returns the time-series history (never nil).
+func (s *ServerPool) History() *History { return s.history }
 
 // SetAgent attaches the AI decision loop (for the status / kill-switch API).
 func (s *ServerPool) SetAgent(a *AgentController) {
@@ -146,6 +154,8 @@ func NewServerPool(strat strategy.SelectionStrategy[*Backend]) *ServerPool {
 	}
 	p := &ServerPool{
 		policies: policy.NewStore(policy.StrategyType(strat.Name())),
+		events:   NewEventLog(eventLogCap),
+		history:  NewHistory(historyCap),
 	}
 	p.active.Store(&activeState{strat: strat, policyVersion: p.policies.Current().Version})
 	return p
@@ -184,6 +194,7 @@ func (s *ServerPool) SetStrategyWithReason(strat strategy.SelectionStrategy[*Bac
 	ver := s.publishPolicyLocked(policy.StrategyType(strat.Name()), reason)
 	s.active.Store(&activeState{strat: strat, policyVersion: s.policies.Current().Version})
 	s.mux.Unlock()
+	s.events.Add("policy", "", fmt.Sprintf("%s (policy v%d, %s)", strat.Name(), s.policies.Current().Version, reason))
 
 	if col != nil {
 		col.RecordStrategySwitch(strat.Name(), time.Since(start))
@@ -485,8 +496,10 @@ func (s *ServerPool) HealthCheck() {
 
 			if wasAlive != alive {
 				if alive {
+					s.events.Add("health", b.Name, "UP")
 					log.Printf("[HealthCheck] Backend %s status changed to -> UP", b.URL)
 				} else {
+					s.events.Add("health", b.Name, "DOWN")
 					log.Printf("[HealthCheck] Backend %s status changed to -> DOWN", b.URL)
 				}
 			}

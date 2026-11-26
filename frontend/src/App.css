@@ -527,3 +527,50 @@
     align-items: flex-start;
   }
 }
+
+/* ------------------------------------------------------------------ Phase 18: research dashboard */
+.view-tabs { display: flex; gap: 8px; margin: 12px 0; }
+.view-tab { padding: 6px 16px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.15); background: transparent; color: inherit; cursor: pointer; }
+.view-tab.active { background: rgba(108,140,255,0.25); border-color: #6c8cff; }
+.research-main { display: block; }
+.rs-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.rs-panel { padding: 16px; }
+.rs-panel h2 { margin: 0 0 10px; font-size: 1.05rem; }
+.rs-panel h3 { margin: 14px 0 6px; font-size: 0.95rem; opacity: 0.85; }
+.rs-wide { grid-column: 1 / -1; }
+.rs-kv { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 16px; margin: 10px 0; }
+.rs-kv div { display: flex; flex-direction: column; }
+.rs-kv dt { font-size: 0.75rem; opacity: 0.65; }
+.rs-kv dd { margin: 0; font-weight: 600; }
+.rs-muted { opacity: 0.6; font-weight: 400; }
+.rs-note { font-size: 0.78rem; opacity: 0.7; margin: 8px 0 0; }
+.rs-actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.rs-fallback { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border-radius: 8px; border-left: 4px solid; font-size: 0.85rem; }
+.rs-fallback.rs-ok { border-color: #35c2a1; background: rgba(53,194,161,0.10); }
+.rs-fallback.rs-warn { border-color: #ff9f43; background: rgba(255,159,67,0.14); }
+.rs-fallback.rs-danger { border-color: #ff4d4d; background: rgba(255,77,77,0.14); }
+.rs-fallback.rs-info { border-color: #6c8cff; background: rgba(108,140,255,0.12); }
+.rs-fallback.rs-muted { border-color: #8a93a6; background: rgba(138,147,166,0.10); }
+.rs-badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.72rem; font-weight: 600; margin-right: 4px; }
+.rs-badge.rs-ok { background: rgba(53,194,161,0.2); color: #35c2a1; }
+.rs-badge.rs-warn { background: rgba(255,159,67,0.2); color: #ff9f43; }
+.rs-badge.rs-danger { background: rgba(255,77,77,0.2); color: #ff6b6b; }
+.rs-badge.rs-info { background: rgba(108,140,255,0.2); color: #8fa8ff; }
+.rs-badge.rs-muted { background: rgba(138,147,166,0.18); }
+.rs-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 10px; }
+.rs-table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+.rs-table th { text-align: left; font-weight: 600; opacity: 0.7; padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.12); }
+.rs-table td { padding: 4px 6px; border-bottom: 1px solid rgba(255,255,255,0.06); vertical-align: top; }
+.rs-chart { margin: 8px 0 14px; }
+.rs-chart-title { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px; font-size: 0.85rem; font-weight: 600; }
+.rs-svg { width: 100%; height: auto; display: block; }
+.rs-gridline { stroke: rgba(255,255,255,0.08); }
+.rs-axis { fill: rgba(255,255,255,0.55); font-size: 10px; }
+.rs-legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 0.75rem; font-weight: 400; }
+.rs-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+.rs-legend-item i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; }
+.rs-marker-legend { display: flex; gap: 10px; flex-wrap: wrap; font-size: 0.75rem; margin-bottom: 6px; }
+.rs-events { list-style: none; padding: 0; margin: 0; font-size: 0.8rem; }
+.rs-events li { padding: 2px 0; }
+.rs-error { background: rgba(255,77,77,0.15); border: 1px solid #ff4d4d; padding: 8px 12px; border-radius: 8px; margin-bottom: 12px; }
+@media (max-width: 900px) { .rs-grid { grid-template-columns: 1fr; } }

@@ -5,6 +5,7 @@ import { TrafficGenerator } from './components/TrafficGenerator';
 import { BackendCards } from './components/BackendCards';
 import { StrategyExplainer } from './components/StrategyExplainer';
 import { RequestLog } from './components/RequestLog';
+import { ResearchDashboard } from './components/research/ResearchDashboard';
 import {
   fetchStatus,
   setStrategy,
@@ -21,6 +22,7 @@ export function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [activeEvents, setActiveEvents] = useState([]);
   const [logs, setLogs] = useState([]);
+  const [view, setView] = useState('operate'); // 'operate' (Phase 1 dashboard) | 'research' (Phase 18)
 
   // Load cluster state from Go load balancer
   const loadClusterStatus = useCallback(async () => {
@@ -136,6 +138,16 @@ export function App() {
         onRefresh={loadClusterStatus}
       />
 
+      <nav className="view-tabs" aria-label="dashboard view">
+        <button id="tab-operate" className={`view-tab ${view === 'operate' ? 'active' : ''}`} onClick={() => setView('operate')}>Operations</button>
+        <button id="tab-research" className={`view-tab ${view === 'research' ? 'active' : ''}`} onClick={() => setView('research')}>Research</button>
+      </nav>
+
+      {view === 'research' ? (
+        <main className="research-main">
+          <ResearchDashboard />
+        </main>
+      ) : (
       <main className="dashboard-grid">
         {/* Top: Dynamic Network Topology Flow */}
         <div className="grid-full-width">
@@ -166,6 +178,7 @@ export function App() {
           <RequestLog logs={logs} onClear={() => setLogs([])} />
         </div>
       </main>
+      )}
     </div>
   );
 }

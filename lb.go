@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -249,6 +250,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		}
 		newStatus := !b.IsAlive()
 		b.SetAlive(newStatus)
+		pool.Events().Add("health", b.Name, map[bool]string{true: "UP (manual toggle)", false: "DOWN (manual toggle)"}[newStatus])
 		log.Printf("[LoadBalancer] Toggled %s alive -> %v", b.Name, newStatus)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"name": b.Name, "alive": newStatus})
@@ -306,6 +308,99 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		log.Printf("[LoadBalancer] Applied action %d (decision %q) -> policy v%d", *body.Action, body.DecisionID, pool.Policies().Current().Version)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "decision_id": body.DecisionID, "policy": pool.Policies().Current()})
+
+	case r.URL.Path == "/api/dashboard" && r.Method == http.MethodGet:
+		col := pool.GetCollector()
+		if col == nil {
+			http.Error(w, `{"error":"metrics collector not configured"}`, http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(buildDashboard(pool, col.CollectSnapshot(), time.Now()))
+
+	case r.URL.Path == "/api/history" && r.Method == http.MethodGet:
+		since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"points": pool.History().Since(since), "interval_ms": 2000})
+
+	case r.URL.Path == "/api/events/log" && r.Method == http.MethodGet:
+		since, _ := strconv.ParseUint(r.URL.Query().Get("since"), 10, 64)
+		evs, last := pool.Events().Since(since)
+		if evs == nil {
+			evs = []Event{}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"events": evs, "last_id": last})
+
+	case r.URL.Path == "/api/events/marker" && r.Method == http.MethodPost:
+		var body struct {
+			Kind    string `json:"kind"`
+			Backend string `json:"backend"`
+			Detail  string `json:"detail"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil || !markerKinds[body.Kind] {
+			http.Error(w, `invalid marker: expected {"kind":"fault|note|experiment","backend":"","detail":""}`, http.StatusBadRequest)
+			return
+		}
+		if len(body.Backend) > 64 || len(body.Detail) > maxEventDetail {
+			http.Error(w, "backend or detail too long", http.StatusBadRequest)
+			return
+		}
+		e := pool.Events().Add(body.Kind, body.Backend, body.Detail)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(e)
+
+	case r.URL.Path == "/api/agent/learner" && r.Method == http.MethodGet:
+		w.Header().Set("Content-Type", "application/json")
+		ag := pool.GetAgent()
+		if ag == nil {
+			_, _ = w.Write([]byte(`{"available":false,"error":"agent not configured"}`))
+			return
+		}
+		in, ok := ag.introspector()
+		if !ok {
+			_, _ = w.Write([]byte(`{"available":false,"error":"agent does not support introspection"}`))
+			return
+		}
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		data, err := in.Learner(r.Context(), limit)
+		if err != nil {
+			_ = json.NewEncoder(w).Encode(map[string]any{"available": false, "error": err.Error()})
+			return
+		}
+		_, _ = w.Write(data)
+
+	case r.URL.Path == "/api/agent/reset" && r.Method == http.MethodPost:
+		ag := pool.GetAgent()
+		if ag == nil {
+			http.Error(w, `{"error":"agent not configured"}`, http.StatusServiceUnavailable)
+			return
+		}
+		var body struct {
+			Archive *bool `json:"archive"`
+		}
+		_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&body)
+		archive := body.Archive == nil || *body.Archive
+		now := time.Now()
+		if err := ag.mgr.ResetToBaseline(now); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ag.ResetPending(now)
+		out := map[string]any{"status": "ok", "policy": pool.Policies().Current(), "model_reset": false}
+		if in, ok := ag.introspector(); ok {
+			if data, err := in.Reset(r.Context(), archive, "reset-to-baseline"); err != nil {
+				out["agent_error"] = err.Error() // the policy is already at baseline; report that the model was not reset
+			} else {
+				out["model_reset"] = true
+				var raw any
+				_ = json.Unmarshal(data, &raw)
+				out["agent"] = raw
+			}
+		}
+		log.Printf("[LoadBalancer] Reset to baseline (model_reset=%v)", out["model_reset"])
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(out)
 
 	case r.URL.Path == "/api/agent" && r.Method == http.MethodGet:
 		ag := pool.GetAgent()

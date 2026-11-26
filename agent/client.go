@@ -3,6 +3,7 @@ package agent
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -102,4 +103,63 @@ func (c *Client) Decide(ctx context.Context, req *DecisionRequest) (*DecisionRes
 		return nil, &CallError{kind, err}
 	}
 	return out, nil
+}
+
+// MaxLearnerBytes bounds the learner-introspection response (it carries up to 100 recent decisions).
+const MaxLearnerBytes = 512 * 1024
+
+// Introspector is the optional read-only / maintenance side of the agent API used by the dashboard.
+type Introspector interface {
+	Learner(ctx context.Context, limit int) ([]byte, error)
+	Reset(ctx context.Context, archive bool, reason string) ([]byte, error)
+}
+
+func (c *Client) do(ctx context.Context, method, path string, body []byte, limit int64) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	hr, err := http.NewRequestWithContext(ctx, method, c.base+path, rd)
+	if err != nil {
+		return nil, &CallError{FailRequest, err}
+	}
+	if body != nil {
+		hr.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.http.Do(hr)
+	if err != nil {
+		var ne net.Error
+		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout()) {
+			return nil, &CallError{FailTimeout, err}
+		}
+		return nil, &CallError{FailConnect, err}
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, &CallError{FailConnect, err}
+	}
+	if int64(len(data)) > limit {
+		return nil, &CallError{FailMalformed, fmt.Errorf("response exceeds %d bytes", limit)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, &CallError{FailStatus, fmt.Errorf("HTTP %d: %.200s", resp.StatusCode, string(data))}
+	}
+	return data, nil
+}
+
+// Learner fetches GET /v1/learner?limit=N (raw JSON, passed through to the dashboard).
+func (c *Client) Learner(ctx context.Context, limit int) ([]byte, error) {
+	if limit < 1 || limit > 500 {
+		limit = 100
+	}
+	return c.do(ctx, http.MethodGet, fmt.Sprintf("/v1/learner?limit=%d", limit), nil, MaxLearnerBytes)
+}
+
+// Reset asks the agent to archive its model and restart learning from scratch (POST /v1/reset).
+func (c *Client) Reset(ctx context.Context, archive bool, reason string) ([]byte, error) {
+	body, _ := json.Marshal(map[string]any{"archive": archive, "reason": reason})
+	return c.do(ctx, http.MethodPost, "/v1/reset", body, MaxBodyBytes)
 }

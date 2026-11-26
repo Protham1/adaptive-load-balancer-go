@@ -251,6 +251,7 @@ func (m *PolicyManager) SafetyFallback(reason string, now time.Time) {
 	m.events = append(m.events, SafetyEvent{At: now, Kind: "fallback", Reason: reason})
 	m.trimEvents()
 	m.count("safety_fallback")
+	m.pool.Events().Add("safety", "", "fallback to baseline: "+reason)
 	log.Printf("[Safety] fallback to baseline (%s); AI locked out until %s", reason, m.lockedUntil.Format(time.RFC3339))
 }
 
@@ -281,8 +282,10 @@ func (m *PolicyManager) Kill(on bool, baseline *policy.ActionID, now time.Time) 
 		}
 		m.lastSwitch = now
 		m.events = append(m.events, SafetyEvent{At: now, Kind: "kill", Reason: "manual kill switch"})
+		m.pool.Events().Add("kill", "", "AI disabled (kill switch)")
 	} else {
 		m.events = append(m.events, SafetyEvent{At: now, Kind: "resume", Reason: "manual resume"})
+		m.pool.Events().Add("resume", "", "AI re-enabled")
 	}
 	m.trimEvents()
 	return nil

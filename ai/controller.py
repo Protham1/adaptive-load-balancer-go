@@ -54,6 +54,7 @@ class ControllerConfig:
     n_backends: Optional[int] = None
     model_path: Optional[str] = None
     seed: int = 0
+    predictor: Optional[object] = None  # Phase 20: PredictiveContext appending forecast features
 
     def __post_init__(self):
         if self.mode not in ("shadow", "live"):
@@ -129,6 +130,8 @@ class BanditController:
         if self.backend_ids is None and val.ok:
             self.backend_ids = tuple(state.backend_ids)
         dim = context_dim(self.cfg.context_mode, len(state.backend_ids))
+        if self.cfg.predictor is not None:
+            dim += len(self.cfg.predictor.feature_names())
         learner_dim = getattr(self.learner, "dim", None)
         if val.ok and learner_dim is not None and learner_dim != dim:
             val.ok, val.reasons = False, [f"context dim {dim} != learner dim {learner_dim}"]
@@ -204,6 +207,8 @@ class BanditController:
         mask = policy.action_mask
         current = action_for_strategy(metrics.strategy)
         context = build_context(state, self.cfg.context_mode)
+        if self.cfg.predictor is not None:  # forecast one decision interval ahead from the decision-time snapshots
+            context = self.cfg.predictor.augment(context, t, self.cfg.settle_s + self.cfg.measure_s)
         forced = False
         try:
             if self._force_safe:

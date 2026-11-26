@@ -45,6 +45,14 @@ class Learner:
     def config(self) -> dict:
         return {}
 
+    def pulls(self, action: int) -> Optional[int]:
+        """How often `action` has been updated (None if the learner does not track it)."""
+        return None
+
+    def greedy(self, x: np.ndarray, mask: Sequence[bool], rng: np.random.Generator) -> Selection:
+        """Pure exploitation among the allowed actions (used by the exploration guard)."""
+        raise NotImplementedError
+
     def state_dict(self) -> dict:
         return {}
 
@@ -128,6 +136,13 @@ class MeanEpsilonGreedy(Learner):
         self.n[action] += 1
         self.mean[action] += (reward - self.mean[action]) / self.n[action]
 
+    def pulls(self, action):
+        return int(self.n[action])
+
+    def greedy(self, x, mask, rng):
+        scores = {a: float(self.mean[a]) for a in self._allowed(mask)}
+        return Selection(_argmax_random_tie(scores, rng), _scores_list(scores), False)
+
     def state_dict(self):
         return {"n": self.n.tolist(), "mean": self.mean.tolist()}
 
@@ -195,6 +210,13 @@ class LinUCB(Learner):
     def update(self, x, action, reward):
         self.model.update(action, x, reward)
 
+    def pulls(self, action):
+        return int(self.model.n[action])
+
+    def greedy(self, x, mask, rng):
+        mu = {a: self.model.predict(a, x) for a in self._allowed(mask)}
+        return Selection(_argmax_random_tie(mu, rng), _scores_list(mu), False)
+
     def state_dict(self):
         return self.model.state_dict()
 
@@ -223,6 +245,13 @@ class LinearEpsilonGreedy(Learner):
             return Selection(int(untried[int(rng.integers(len(untried)))]), _scores_list(mu), True)
         if rng.random() < self.epsilon:
             return Selection(int(allowed[int(rng.integers(len(allowed)))]), _scores_list(mu), True)
+        return Selection(_argmax_random_tie(mu, rng), _scores_list(mu), False)
+
+    def pulls(self, action):
+        return int(self.model.n[action])
+
+    def greedy(self, x, mask, rng):
+        mu = {a: self.model.predict(a, x) for a in self._allowed(mask)}
         return Selection(_argmax_random_tie(mu, rng), _scores_list(mu), False)
 
     def update(self, x, action, reward):

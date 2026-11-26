@@ -517,6 +517,14 @@ func run(sc *Scenario, target string, ctrl map[string]string, rawScenario []byte
 			mu.Lock()
 			faults = append(faults, fa)
 			mu.Unlock()
+			// best-effort marker so the dashboard can draw the injection on its time axis
+			det, _ := json.Marshal(f.Set)
+			mb, _ := json.Marshal(map[string]string{"kind": "fault", "backend": f.Backend, "detail": string(det)})
+			mc := &http.Client{Timeout: time.Second}
+			if r, err := mc.Post(target+"/api/events/marker", "application/json", bytes.NewReader(mb)); err == nil {
+				io.Copy(io.Discard, r.Body)
+				r.Body.Close()
+			}
 		}()
 	}
 

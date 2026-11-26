@@ -99,6 +99,22 @@ SCENARIOS: Dict[str, Scenario] = {s.name: s for s in [
 ]}
 
 
+def _ramp_up(t):  # Phase 20: load rises linearly 40 -> 118 rps over 240 s (~98% of capacity), then holds
+    return Conditions(40.0 + (118.0 - 40.0) * min(t, 240.0) / 240.0)
+
+
+def _oscillating(t):  # Phase 20: slow periodic load, 75 +- 40 rps, period 180 s
+    return Conditions(75.0 + 40.0 * math.sin(2.0 * math.pi * t / 180.0))
+
+
+# Trend-bearing scenarios for the predictive layer. Kept separate from SCENARIOS so that the Phase 9
+# experiments (which iterate SCENARIOS) remain exactly reproducible.
+TREND_SCENARIOS: Dict[str, Scenario] = {s.name: s for s in [
+    Scenario("ramp_up", 360, _ramp_up),
+    Scenario("oscillating", 360, _oscillating),
+]}
+
+
 def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 

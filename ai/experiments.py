@@ -43,10 +43,10 @@ def stream_scenarios(seed: int) -> List[Scenario]:
 
 
 def run_episode(learner: Learner, scenarios: Sequence[Scenario], seed: int, context_mode: str = "compact",
-                reward: RewardConfig = RewardConfig(), cycles: int = 1, poll_s: float = 2.0):
+                reward: RewardConfig = RewardConfig(), cycles: int = 1, poll_s: float = 2.0, predictor=None):
     env = SimEnvironment(scenarios, seed=seed)
     cfg = ControllerConfig(mode="live", context_mode=context_mode, reward=reward,
-                           run_id=f"s{seed}", seed=seed)
+                           run_id=f"s{seed}", seed=seed, predictor=predictor)
     ctl = BanditController(learner, cfg, DecisionLog())
     records = run_controller(env, ctl, env.total_duration * cycles, poll_s)
     return env, records

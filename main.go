@@ -93,6 +93,9 @@ func main() {
 		log.Printf("AI agent disabled (set LB_AGENT_URL to enable)")
 	}
 
+	// Phase 18: bounded time-series history for the research dashboard (sampled from the metrics window).
+	go serverPool.History().Run(context.Background(), metricsCollector, serverPool, 2*time.Second)
+
 	// 3. Start Periodic Background Health Check
 	healthEvery := 10 * time.Second
 	if v, err := strconv.Atoi(os.Getenv("LB_HEALTH_INTERVAL_MS")); err == nil && v > 0 {

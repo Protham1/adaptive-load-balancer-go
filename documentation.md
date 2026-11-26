@@ -1190,12 +1190,137 @@ python -m experiments.generator.build_scenarios                     # (re)genera
 python -m experiments.runner.matrix --experiments all --reps 3      # ~2.3 h; resumable; add --reps 5 to extend
 python -m experiments.runner.matrix --experiments E4 --reps 5 --dry-run     # inspect the randomized order only
 python -m experiments.analysis.report                                # statistics, report.md, plots
-python -m pytest experiments/tests ai/tests -q                       # 154 Python tests (27 for this phase)
+python -m pytest experiments/tests ai/tests -q                       # 187 Python tests (27 for Phase 14-17, 33 for Phases 19-20)
 ```
 
 ---
 
-## 20. Architectural Summary & Best Practices
+## 20. Phase 18 — Frontend Research Dashboard
+
+The existing React/Vite dashboard (Phase 1, now the **Operations** view) is extended with a **Research** view, switched with two tabs under the header. It was built after the metrics API and the policy-event schema were stable, and adds no new JavaScript dependency (charts are plain SVG).
+
+### 20.1 Requirement → implementation
+| Requirement | Where it is shown | Data source |
+| :--- | :--- | :--- |
+| Current strategy, policy version, model version, last decision time, controller status | **Controller status** panel: strategy; policy `vN` with its *reason code*; model version; "last decision 10 s ago"; controller state (active / disabled (kill switch) / shadow / not configured); rule-based controller state; accepted/rejected counts | `GET /api/dashboard` |
+| Per-backend CPU, memory, active connections, RPS, p95, error rate, health, effective weight | **Backends** table; also **traffic share** (what was actually routed) | `GET /api/dashboard` |
+| Latency and throughput over time with fault-injection markers | **Performance over time**: latency p50/p95/p99, throughput, error rate; vertical markers for faults, policy switches, safety fallbacks, kill/resume, reset, backend up/down (hover for detail) | `GET /api/history`, `GET /api/events/log` |
+| Reward components and cumulative reward | **Reward** panel: the four signed components per evaluated window (safety-override windows show a gap, not a zero) and the cumulative reward, with the reward formula and weights | `GET /api/agent/learner` |
+| Strategy history, explore/exploit, accepted/rejected events | **Strategy history** strip (colored segments with policy versions) and the **Policy decisions** table: *explore/exploit* badge (and "capped" when the exploration guard overrode it), *accepted/rejected* with the Go reason code, agent failures, reward, decision latency | `GET /api/agent` (Go side) joined by decision ID with `GET /api/agent/learner` (learner side) |
+| AI enable/disable toggle and a clear fallback indicator | **Disable AI (kill switch) / Enable AI** button and **Reset to baseline** (with a confirmation); a banner that is green *AI active*, blue *SHADOW*, amber *FALLBACK: safety lockout* (with the triggering reason) or red *FALLBACK: AI disabled* | `POST /api/agent/kill`, `POST /api/agent/reset` |
+| Confidence only if calibrated | **No confidence is shown.** LinUCB's scores are optimistic value estimates, not calibrated probabilities. The table has a column labelled "UCB est." and a standing note saying so; the learner endpoint returns `"confidence": {"available": false, …}` | — |
+
+**Honest labelling.** CPU and memory are *host-level* readings shared by all backend processes on the machine (Phase 1 limitation), so every row shows the same value and the table says so; a missing reading renders as `–` and is `null` in the API, never `0`. *Effective weight* is only shown for weight-based strategies (static SWRR, adaptive) and is `null` ("not used by Round-Robin") otherwise; the **traffic share** column always shows reality.
+
+### 20.2 New Go endpoints (all bounded, none per-request)
+| Endpoint | Purpose |
+| :--- | :--- |
+| `GET /api/dashboard` | one aggregated payload: strategy, policy snapshot, agent summary (model version, last decision, accepted/rejected, failures, latency), fallback state, global metrics, rule-controller state, per-backend rows, host-resource note |
+| `GET /api/history?since=<ms>` | time series sampled every 2 s from the metrics window; bounded ring of 900 points (30 min). Error rate is converted from errors/s to a fraction |
+| `GET /api/events/log?since=<id>` / `POST /api/events/marker` | bounded ring of 500 events: policy switches, safety fallbacks, kill/resume/reset, backend health changes (all emitted by the LB itself) plus **markers** posted by the load generator when it applies a fault. Only the kinds `fault`, `note`, `experiment` are accepted from outside, so nobody can spoof a safety event; detail ≤ 200 bytes |
+| `GET /api/agent/learner?limit=N` | proxy to the learner's introspection endpoint; fails soft (`{"available": false, "error": …}`) if the agent is down or absent |
+| `POST /api/agent/reset` | reset-to-baseline (§21.6) |
+
+`cmd/loadgen` now posts a fault marker (best effort, 1 s timeout) whenever it injects a fault, so experiments draw their own injection times on the dashboard.
+
+### 20.3 Frontend structure and verification
+```text
+frontend/src/lib/dashboardData.js           pure functions: scales/ticks, gap-preserving line paths, merging, strategy segments,
+                                            event markers, reward series, decision join, fallback states
+frontend/src/components/research/           charts.jsx (SVG), ResearchView.jsx (presentational), ResearchDashboard.jsx (polling container)
+frontend/test/dashboardData.test.js         10 unit tests (node --test)
+frontend/test/render.test.mjs               5 server-side render tests of the whole page with fixture data (no browser)
+scripts/e2e_dashboard.py                    20 live checks against the real stack (LB + backends + Python agent + load generator)
+```
+`npm test` (15 tests), `npm run build` and `npm run lint` pass (remaining lint warnings are of the same kind as in the Phase 1 components). The render tests assert every element of the table above, both fallback states, the kill-switch/enable button text, that missing CPU renders as `–`, graceful degradation with no agent/learner/data, and that **no text matches a confidence percentage**. The 20-check live script verifies each endpoint against a running stack, that the load generator's fault marker arrives, that the kill switch flips the fallback indicator, and that the production bundle is served at `/`.
+
+> **Not verified in a real browser.** I could exercise the data layer, the full component tree (server-side rendering) and every endpoint, but I did not look at the page in a browser, so layout, spacing and chart readability have not been visually reviewed. Charts have no zoom/pan, the page polls (2 s / 4 s) rather than streaming, and history lives in the LB's memory (a restart empties it).
+
+### 20.4 Defects found while building it
+A tick-spacing bug in the chart helper (a range 0–100 got a step of 50; found by the unit test); a CSS class used for both the page grid and chart grid lines; an empty history encoded as `null` instead of `[]` (found by the live check, fixed in the API); and a semantic gap: *reset-to-baseline* published nothing when the baseline was already active, so the reset left no trace and kept the old strategy state. It now always publishes a fresh baseline policy (new strategy instance, new version, reason `reset_to_baseline`), with a regression test.
+
+---
+
+## 21. Phase 19 — Online Learning and Persistence
+
+**Terminology.** The learner is a **contextual bandit**: online learning from (context, action, reward) samples, where each decision is treated as independent. It is **not** full reinforcement learning: it does not model state transitions, long-term consequences of an action on later states, or discounted returns. The paper should say "contextual bandit / online learning", not "reinforcement learning".
+
+### 21.1 Incremental updates (nothing is retrained from scratch)
+One update per evaluated window: a rank-1 **Sherman–Morrison** update of the per-action ridge inverse, O(d²). Measured (this machine): **update 23 µs** (15-dim compact context), 96 µs (29-dim full); **selection 108 µs / 253 µs**. A 30 s decision interval therefore leaves the learner idle > 99.99 % of the time. No neural network is involved.
+
+### 21.2 What is persisted (`ai/persistence.py`, model format 2)
+`learner`, `config` (α, ridge, …), **`meta`** — context mode, dimension, State version, backend IDs, **feature-schema hash** (names and order of every context feature, including appended forecast features), **reward configuration** (all weights/thresholds) and its hash — `counters`, the model `state`, `extra` (drift-monitor state, so the reference window survives a restart), `created_at`/`saved_at`, and a **SHA-256 checksum**. **Decision history** is persisted separately as append-only JSONL: the learner log (context, scores, explore flag, reward breakdown) and the Go-side decision log (accepted/rejected with reason codes).
+
+### 21.3 Restart is validated and reproducible
+| Situation | Behaviour |
+| :--- | :--- |
+| algorithm, dimension, context mode, State version, backend set, **feature schema** or **reward configuration** differs from the saved model | **refused** (HTTP 500 `model_incompatible` with the exact field), or archived with `--on-incompatible reset`; a changed reward can be accepted explicitly with `--allow-reward-change` |
+| checksum mismatch, truncated or unreadable file | rejected; the **previous checkpoint (`<model>.prev`) is used automatically** and the load info reports `restored_from_backup`; if both are bad the model is refused |
+| compatible model | restored: model, counters, drift reference window; the first decision after restart reproduces the pre-restart scores exactly (tested) |
+| **decision history → model** | `python -m ai.replay --log … --model …` rebuilds the learner by replaying the logged (context, action, reward) triples and verifies it is **identical to the checkpoint** (tested, including `reset` events starting a new lineage) |
+
+**Checkpoint policy.** Atomic write (temp file → `fsync` → rename; the old file becomes `.prev`) **every N updates (default 1)**, **periodically** (every 30 s, only if there are unsaved updates), and **on graceful shutdown** (SIGINT, SIGTERM, SIGBREAK; verified with a real process). A hard kill (e.g. `TerminateProcess`, which the experiment runner uses) cannot run a handler, which is why the per-update default exists: at most the in-flight window is lost. Cost: **≈ 57–66 ms per checkpoint** on this Windows machine (dominated by `fsync`), 27 KB (15-dim) / 98 KB (29-dim); one per 30 s window is negligible.
+
+### 21.4 Drift tracking (`ai/drift.py`) — flags, never acts
+* **Reward:** one-sided **Page-Hinkley** test for a sustained *drop* of the reward mean (δ = 0.02, λ = 0.5, in reward units).
+* **Workload:** **Population Stability Index** between a frozen reference window (first 30 observations) and the most recent 30, on the request rate, p95 latency and error rate (5 bins, Laplace-smoothed; < 0.1 stable, 0.1–0.25 moderate, **> 0.25 flagged**).
+* The status (`drift_suspected`, reasons, PSIs, Page-Hinkley state) is logged, exposed at `/v1/learner` and `/v1/health`, and shown in the dashboard. It never changes the policy: the operator decides whether to continue or reset. A first version with a tiny smoothing constant and 10 bins flagged drift on stationary data (empty bins dominate small samples); the Laplace smoothing / 5 bins / 30-sample windows fix was found by a unit test. **Thresholds are a priori and have not been validated on a real drifting workload.**
+
+### 21.5 Bounded exploration and safety gates (live mode)
+* **Exploration guard** (`ai/guard.py`, on by default in the CLI): *first-time tries* of an action are always allowed (the learner has no data about it); *repeated* uncertainty-driven exploration is capped to **50 % of the last 10 decisions** — beyond that the choice is replaced by the greedy one (logged as `guard_overridden`, shown as "capped"). LinUCB's α is clamped to ≤ 1.0. Test: with a zero budget no repeated exploration survives.
+* The Go safety layer is unchanged and still gates everything: minimum policy age, safety fallback and lockout, health filtering, kill switch.
+
+### 21.6 Reset-to-baseline for experiments
+`POST /v1/reset` on the agent archives the model (`<model>.<timestamp>.archived`, plus `.prev`), clears the learner, pending windows, drift state and guard, and writes a `reset` event to the log. `POST /api/agent/reset` on the LB additionally applies a **fresh baseline policy** immediately, clears any safety lockout and the in-flight evaluation window, and calls the agent; if the agent is unreachable the policy is still reset and the response says `model_reset: false`. The AI enabled/disabled state is not changed. Also available as the dashboard's *Reset to baseline* button.
+
+### 21.7 Verification and limits
+18 new Python tests (`ai/tests/test_phase19.py`) cover integrity/backup, every refusal case, reproducibility by replay, checkpoint cadence (update/periodic/shutdown, including a **real-process graceful-shutdown test**), drift detection, the exploration bound, reset, the learner view and the absence of a confidence value; 13 Go tests cover the new endpoints; the live script checks the checkpoint checksum, the persisted schema/reward config, the kill switch and the reset against the running stack. **Limits:** one service instance is assumed (no file locking between processes); drift thresholds are untested on real drift; a reward-configuration change invalidates a model by design (the reward hash is part of the identity).
+
+---
+
+## 22. Phase 20 — Optional Predictive Layer
+
+Prediction is treated as an extension to be justified by results, not assumed. **Result: it did not improve the load-balancing objective in this evaluation, and it is not recommended.**
+
+### 22.1 What was built (`ai/predict.py`, `ai/predict_eval.py`)
+Three cheap, causal forecasters over irregularly spaced observations — **moving average**, **Holt EMA-trend** and **windowed linear regression** — plus a persistence ("last value") baseline. `PredictiveContext` appends the forecast of the request rate, p95 latency and error rate (one decision interval ahead, clipped to [0,1]) to the bandit's compact context; it is wired into the controller and the decision service (`--predict ma|ema|linreg`), and the forecast features are part of the feature-schema hash (a model trained with them cannot be loaded without them; tested). Causality is tested by changing the *future* and checking the forecast is unchanged.
+
+### 22.2 Protocol (no leakage; the objective is what counts)
+* **Forecast accuracy:** each series is split **chronologically** 60 % train / 40 % test; hyper-parameters are chosen on the train part only (a test proves that destroying the test period cannot change the choice); test errors use only data observed before each forecast; compared with persistence. Sources: simulator workloads (10 s sampling, 30 s horizon) and the **real** per-second offered-load traces of the Phase 14 runs (E6 flash crowd, E8 mixed; 4 s horizon).
+* **Control (the claim that matters):** reactive LinUCB vs LinUCB with forecast features, **same scenarios, same seeds, same α (0.05)**, paired by seed; predictor type/parameters chosen on 5 **dev seeds**, evaluated on 30 disjoint **test seeds**; objective = mean reward per window (also p95 and error rate); paired bootstrap CI, exact sign-flip test, Holm correction and the same claim rule as Phase 17. Two streams: *trend* (new `ramp_up` and `oscillating` scenarios, built to favour forecasting) and *standard* (the six Phase 9 scenarios).
+
+### 22.3 Results
+**Forecast skill vs persistence on the held-out 40 %** (MAE; positive = better than persistence):
+
+| Series | persistence MAE | MA | EMA-trend | Linear regression |
+| :--- | ---: | ---: | ---: | ---: |
+| sim ramp_up | 0.0044 | −142 % | **+12 %** | −70 % |
+| sim oscillating | 0.0443 | −14 % | −40 % | −57 % |
+| sim traffic_spike | 0.0247 | −93 % | −94 % | −253 % |
+| sim balanced (flat) | 0.0014 | **+23 %** | +14 % | +12 % |
+| real E6 flash crowd (offered rps) | 264.4 | −107 % | −7 % | −151 % |
+| real E8 mixed (offered rps) | 51.5 | −324 % | −37 % | −202 % |
+
+The forecasters beat persistence only on a steady ramp (EMA) and on a flat noisy signal (averaging); on step/spike/oscillating loads and on the real traces they are **worse** than "tomorrow equals today".
+
+**Control comparison (30 paired seeds; mean reward per window, higher is better):**
+
+| Stream | Reactive | + MA | + EMA-trend | + Linear regression |
+| :--- | ---: | ---: | ---: | ---: |
+| trend | −0.1075 ± 0.0051 | −0.1080 | −0.1080 | −0.1087 |
+| standard | −0.1452 ± 0.0059 | −0.1456 | −0.1456 | −0.1460 |
+
+Paired differences vs reactive (Holm-adjusted): **no predictive arm is better**. On the trend stream linear regression is *worse* by 0.0012 reward (CI [−0.0023, −0.0004], p = 0.021, claim rule: *worse*); every other comparison — reward, p95 and error rate, both streams — is *inconclusive* with small effects (reward differences ≤ 0.0012, about 1 % of the reward magnitude).
+
+### 22.4 Interpretation
+Accurate forecasting was not even achieved here, and where it was (steady ramp) it did not translate into a better objective: with ~12 decisions per scenario the bandit has few samples from which to learn how to use three extra inputs, the workloads are mostly step-like, and the reward is noisy. As the plan warns, prediction accuracy is not evidence of benefit — here neither accuracy nor benefit materialised, so the extra complexity is not justified. The layer stays as an **optional, tested, off-by-default** component.
+
+### 22.5 Limitations
+Simulator-based control comparison (no live predictive run); the horizon is fixed to one decision interval; the Python service sees one snapshot per interval, so live forecasts would rest on very short histories (sending a short per-second history in the contract would be the first thing to try); the real traces are only 36 s long; only three simple forecasters were tried (more complex models were deliberately not pursued without a repeatable gain).
+
+---
+
+## 23. Architectural Summary & Best Practices
 
 ```mermaid
 flowchart LR
@@ -1284,6 +1409,20 @@ flowchart LR
     RunOne --> Loadgen
     RunOne --> Raw
     Raw --> Stats
+
+    subgraph Research["Phase 18-20: Dashboard, Persistence, Prediction"]
+        Dash["Research dashboard (React): status, backends, time series + markers, reward, decisions, AI toggle"]
+        Persist["Checkpoints (checksum, schema + reward validation, .prev backup) + replay"]
+        Drift["Drift monitor (Page-Hinkley, PSI) + exploration guard"]
+        Pred["Optional forecaster layer (off by default)"]
+    end
+
+    API -->|"/api/dashboard /api/history /api/events/log"| Dash
+    Service -->|"/api/agent/learner"| Dash
+    Dash -->|"kill / reset"| Manager
+    Bandit --> Persist
+    Bandit --> Drift
+    Pred -.-> Bandit
 ```
 
 ### Engineering Best Practices Implemented
@@ -1296,11 +1435,13 @@ flowchart LR
 
 ---
 
-## 21. Next Steps & Road Ahead
+## 24. Next Steps & Road Ahead
 
+* **Look at the dashboard in a browser** and fix layout/readability issues (only the data layer, component tree and endpoints were verified); consider zoom/pan and SSE instead of polling.
+* **Validate the drift thresholds** (Page-Hinkley, PSI) on genuinely drifting live workloads, and decide what policy (if any) should follow a drift flag.
 * **Extend the matrix to the plan's minimum of 5 repetitions** (`--reps 5`, resumable) and beyond (≥ 6 pairs are needed for any paired test to reach p < 0.05); then re-read §19.6 under the claim rule.
 * **Recalibrate E8** (and hence E9/E10) so that the mixed scenario does not saturate every policy; re-run the ablation and the interval sweep.
-* **Warm-start / pre-trained AI arm and longer horizons**, so the comparison measures a converged learner, not only the cold-start cost; consider an action mask that enforces affinity on affinity workloads (A1).
+* **Warm-start / pre-trained AI arm and longer horizons**, so the comparison measures a converged learner; enforce affinity on affinity workloads through the action mask.
+* **Predictive layer, only if revisited:** send a short per-second history in the decision contract and re-test on live traces; the current evidence (§22) says it does not help.
 * **Run the Go race detector** (`go test -race ./...`) on a 64-bit toolchain, including under load with policy switching enabled (still not possible on the current machine).
-* **Tune the Phase 12 safety thresholds and the reward weights on development scenarios**, freeze them, and report them in the experimental setup.
-* **Per-backend resource metrics** (process-level CPU/memory) so CPU/memory features discriminate between backends; report Consistent Hash separately on affinity workloads.
+* **Tune the Phase 12 safety thresholds and the reward weights on development scenarios**, freeze them, and report them in the experimental setup; add per-backend resource metrics (process-level CPU/memory).
