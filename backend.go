@@ -112,8 +112,23 @@ type ServerPool struct {
 	affinityRequired bool
 	ctrl             *controller.Controller // Phase 5 rule-based baseline (optional)
 	agentCtl         *AgentController       // Phase 10 AI decision loop (optional)
+	security         *SecurityConfig        // management-API hardening (nil only in unit tests)
 	events           *EventLog              // Phase 18: bounded research event log
 	history          *History               // Phase 18: bounded time-series history
+}
+
+// Security returns the management-API hardening config (nil = unhardened, unit tests only).
+func (s *ServerPool) Security() *SecurityConfig {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+	return s.security
+}
+
+// SetSecurity installs the management-API hardening config.
+func (s *ServerPool) SetSecurity(c *SecurityConfig) {
+	s.mux.Lock()
+	s.security = c
+	s.mux.Unlock()
 }
 
 // Events returns the event log (never nil).

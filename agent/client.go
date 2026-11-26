@@ -44,6 +44,16 @@ type Client struct {
 	base    string
 	timeout time.Duration
 	http    *http.Client
+	token   string // optional bearer token (the agent API must not be exposed without authentication)
+}
+
+// SetToken sets the bearer token sent with every request ("" = none).
+func (c *Client) SetToken(t string) { c.token = t }
+
+func (c *Client) authorize(r *http.Request) {
+	if c.token != "" {
+		r.Header.Set("Authorization", "Bearer "+c.token)
+	}
 }
 
 // NewClient creates a client. timeout bounds the whole call (connect, send, read).
@@ -74,6 +84,7 @@ func (c *Client) Decide(ctx context.Context, req *DecisionRequest) (*DecisionRes
 		return nil, &CallError{FailRequest, err}
 	}
 	hr.Header.Set("Content-Type", "application/json")
+	c.authorize(hr)
 	resp, err := c.http.Do(hr)
 	if err != nil {
 		var ne net.Error
@@ -128,6 +139,7 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, limit
 	if body != nil {
 		hr.Header.Set("Content-Type", "application/json")
 	}
+	c.authorize(hr)
 	resp, err := c.http.Do(hr)
 	if err != nil {
 		var ne net.Error

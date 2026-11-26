@@ -70,6 +70,7 @@ func LoadAgentConfigFromEnv() (AgentConfig, ManagerConfig) {
 	dur("LB_AGENT_SETTLE_S", &ac.Settle, time.Second)
 	dur("LB_AGENT_MEASURE_S", &ac.Measure, time.Second)
 	dur("LB_AGENT_STEP_S", &ac.StepEvery, time.Second)
+	dur("LB_AGENT_FAILURE_BACKOFF_S", &ac.FailureBackoff, time.Second)
 	dur("LB_AGENT_MAX_DECISION_AGE_S", &mc.MaxDecisionAge, time.Second)
 	dur("LB_AGENT_MIN_POLICY_AGE_S", &mc.MinPolicyAge, time.Second)
 	dur("LB_AGENT_SAFETY_COOLDOWN_S", &mc.SafetyCooldown, time.Second)

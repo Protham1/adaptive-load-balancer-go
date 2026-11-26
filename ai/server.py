@@ -28,6 +28,8 @@ Online learning and persistence (Phase 19)
 from __future__ import annotations
 
 import argparse
+import hmac
+import ipaddress
 import os
 import signal
 import threading
@@ -119,6 +121,10 @@ class DecisionService:
         """Write the model checkpoint (atomic + checksum). Returns True if a file was written."""
         with self._lock:
             if not self.model_path or self.backend_ids is None:
+                return False
+            if not self._model_loaded:
+                # The existing model has not been loaded (or was REFUSED): never overwrite it with an empty
+                # model. It belongs to the operator to inspect, repair, archive or reset.
                 return False
             if not force and self._unsaved == 0:
                 return False
@@ -363,10 +369,62 @@ class DecisionService:
             }
 
 
-def make_handler(service: DecisionService):
+def is_loopback_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+class BoundedServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a cap on concurrent connections: beyond it the client gets an immediate 503
+    instead of spawning another thread (a flood must not exhaust the learner process)."""
+
+    def __init__(self, addr, handler, max_connections: int = 16):
+        super().__init__(addr, handler)
+        self._slots = threading.BoundedSemaphore(max_connections)
+        self.rejected = 0
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.rejected += 1
+            try:
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+RESET_KEYS = {"archive", "reason"}
+
+
+def make_handler(service: DecisionService, token: Optional[str] = None, request_timeout: float = 10.0):
     class Handler(BaseHTTPRequestHandler):
+        timeout = request_timeout  # socket timeout per connection: a stalled client cannot hold a thread forever
+
         def log_message(self, *a):  # keep stdout quiet; decisions are logged as JSONL
             pass
+
+        def _authorized(self) -> bool:
+            """Bearer-token check (constant time). With no token configured the API relies on loopback binding."""
+            if not token:
+                return True
+            got = self.headers.get("Authorization") or ""
+            ok = got.startswith("Bearer ") and hmac.compare_digest(got[7:].encode(), token.encode())
+            if not ok:
+                self._drain(int(self.headers.get("Content-Length") or 0))
+                self._send(401, {"error": "unauthorized", "code": "unauthorized"})
+            return ok
 
         def _send(self, code: int, doc: dict):
             data = dumps_strict(doc)
@@ -387,6 +445,8 @@ def make_handler(service: DecisionService):
             self.close_connection = True
 
         def do_GET(self):
+            if not self._authorized():
+                return
             u = urlparse(self.path)
             if u.path == "/v1/health":
                 self._send(200, service.health())
@@ -400,12 +460,20 @@ def make_handler(service: DecisionService):
                 self._send(404, {"error": "not found", "code": "not_found"})
 
         def do_POST(self):
+            if not self._authorized():
+                return
             if self.path == "/v1/reset":
                 try:
                     n = int(self.headers.get("Content-Length") or 0)
-                    body = loads_strict(self.rfile.read(min(n, 4096))) if n else {}
-                except (ValueError, ContractError):
-                    return self._send(400, {"error": "invalid body", "code": "bad_request"})
+                    if n > 4096:
+                        self._drain(n)
+                        return self._send(413, {"error": "body too large", "code": "too_large"})
+                    body = loads_strict(self.rfile.read(n)) if n else {}
+                    extra = set(body) - RESET_KEYS
+                    if extra or not isinstance(body.get("archive", True), bool) or not isinstance(body.get("reason", ""), str):
+                        raise ContractError(f"unknown or invalid field(s): {sorted(extra) or 'types'}")
+                except (ValueError, ContractError) as e:
+                    return self._send(400, {"error": f"invalid body: {e}", "code": "bad_request"})
                 return self._send(200, service.reset(archive=bool(body.get("archive", True)),
                                                      reason=str(body.get("reason", "operator"))[:64]))
             if self.path != "/v1/decision":
@@ -426,8 +494,14 @@ def make_handler(service: DecisionService):
     return Handler
 
 
-def serve(service: DecisionService, host: str = "127.0.0.1", port: int = 8090) -> ThreadingHTTPServer:
-    srv = ThreadingHTTPServer((host, port), make_handler(service))
+def serve(service: DecisionService, host: str = "127.0.0.1", port: int = 8090, token: Optional[str] = None,
+          allow_remote: bool = False, max_connections: int = 16, request_timeout: float = 10.0) -> BoundedServer:
+    """Create the HTTP server. The learner API is for the local load balancer only: binding anywhere but
+    loopback is refused unless the operator explicitly allows it AND configures a bearer token."""
+    if not is_loopback_host(host) and not (allow_remote and token):
+        raise ValueError(f"refusing to bind the learner API to non-loopback address {host!r}: "
+                         "pass --allow-remote together with --auth-token (and put it behind TLS)")
+    srv = BoundedServer((host, port), make_handler(service, token, request_timeout), max_connections)
     srv.daemon_threads = True
     return srv
 
@@ -451,6 +525,11 @@ def main(argv=None) -> None:
     ap.add_argument("--no-guard", action="store_true", help="disable the exploration guard")
     ap.add_argument("--on-incompatible", default="refuse", choices=("refuse", "reset"))
     ap.add_argument("--allow-reward-change", action="store_true", help="load a model trained under another reward config")
+    ap.add_argument("--auth-token", default=os.environ.get("AI_AGENT_TOKEN", ""), help="bearer token required on every request")
+    ap.add_argument("--allow-remote", action="store_true", help="allow a non-loopback --host (requires --auth-token)")
+    ap.add_argument("--max-connections", type=int, default=16, help="concurrent connections before answering 503")
+    ap.add_argument("--request-timeout", type=float, default=10.0, help="per-connection socket timeout in seconds")
+    ap.add_argument("--log-max-mb", type=int, default=10, help="decision log size bound (rotated, 3 backups)")
     ap.add_argument("--predict", default="none", choices=("none", "ma", "ema", "linreg"),
                     help="Phase 20 predictive layer: append forecast features to the context")
     a = ap.parse_args(argv)
@@ -465,12 +544,17 @@ def main(argv=None) -> None:
     learner = make_learner(a.algo, dim, **kw)
     guard = None if a.no_guard else ExplorationGuard(max_fraction=a.max_explore_fraction)
     svc = DecisionService(learner, a.context, model_path=a.model, max_age_s=a.max_age, seed=a.seed,
-                          log=DecisionLog(a.log, max_memory=2000), checkpoint_every_updates=a.checkpoint_every,
+                          log=DecisionLog(a.log, max_memory=2000, max_bytes=a.log_max_mb << 20),
+                          checkpoint_every_updates=a.checkpoint_every,
                           checkpoint_interval_s=a.checkpoint_interval, guard=guard,
                           allow_reward_change=a.allow_reward_change, on_incompatible=a.on_incompatible,
                           predictor=predictor)
     svc.start_checkpointer()
-    srv = serve(svc, a.host, a.port)
+    try:
+        srv = serve(svc, a.host, a.port, token=a.auth_token or None, allow_remote=a.allow_remote,
+                    max_connections=a.max_connections, request_timeout=a.request_timeout)
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
 
     def graceful(*_):  # SIGINT / SIGTERM / SIGBREAK: stop serving, then the finally-block checkpoints
         threading.Thread(target=srv.shutdown, daemon=True).start()

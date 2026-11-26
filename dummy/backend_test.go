@@ -195,3 +195,24 @@ func TestInvalidFaultValuesRejected(t *testing.T) {
 		}
 	}
 }
+
+func TestFaultControlPortListensOnLoopbackOnly(t *testing.T) {
+	b, _ := start(t, nil)
+	ln := strings.TrimPrefix(b.ControlURL(), "http://")
+	if !strings.HasPrefix(ln, "127.0.0.1:") {
+		t.Fatalf("control URL %s", b.ControlURL())
+	}
+	// a non-loopback local address must not accept connections on the control port
+	addrs, _ := net.InterfaceAddrs()
+	_, port, _ := net.SplitHostPort(ln)
+	for _, a := range addrs {
+		ipn, ok := a.(*net.IPNet)
+		if !ok || ipn.IP.IsLoopback() || ipn.IP.To4() == nil {
+			continue
+		}
+		if conn, err := net.DialTimeout("tcp", net.JoinHostPort(ipn.IP.String(), port), 300*time.Millisecond); err == nil {
+			conn.Close()
+			t.Fatalf("the fault-control port is reachable on %s: it must be loopback-only", ipn.IP)
+		}
+	}
+}

@@ -23,6 +23,7 @@ type RequestEvent struct {
 type EventBus struct {
 	mu          sync.RWMutex
 	subscribers map[chan []byte]struct{}
+	closed      bool
 }
 
 // NewEventBus creates a new EventBus instance
@@ -39,6 +40,37 @@ func (b *EventBus) Subscribe() chan []byte {
 	b.subscribers[ch] = struct{}{}
 	b.mu.Unlock()
 	return ch
+}
+
+// TrySubscribe registers a subscriber unless max (> 0) subscribers already exist.
+func (b *EventBus) TrySubscribe(max int) (chan []byte, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed || (max > 0 && len(b.subscribers) >= max) {
+		return nil, false
+	}
+	ch := make(chan []byte, 64)
+	b.subscribers[ch] = struct{}{}
+	return ch, true
+}
+
+// Close ends every subscription (streams see a closed channel and return) and refuses new ones. Used on
+// shutdown so long-lived SSE connections cannot block a graceful HTTP shutdown.
+func (b *EventBus) Close() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.closed = true
+	for ch := range b.subscribers {
+		close(ch)
+		delete(b.subscribers, ch)
+	}
+}
+
+// Count returns the number of active subscribers.
+func (b *EventBus) Count() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.subscribers)
 }
 
 // Unsubscribe removes and closes a subscriber channel

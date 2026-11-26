@@ -99,7 +99,8 @@ func Start(cfg Config) (*Backend, error) {
 	b := &Backend{cfg: cfg, rng: rand.New(rand.NewSource(cfg.Seed)),
 		faults: Faults{Concurrency: cfg.Concurrency, CPUThreads: 1}}
 	b.sem = make(chan struct{}, cfg.Concurrency)
-	cln, err := net.Listen("tcp", ":"+cfg.ControlPort)
+	// The fault-control API is unauthenticated and can take a backend down: it listens on loopback ONLY.
+	cln, err := net.Listen("tcp", "127.0.0.1:"+cfg.ControlPort)
 	if err != nil {
 		return nil, err
 	}

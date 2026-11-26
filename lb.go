@@ -18,6 +18,9 @@ import (
 
 var reqCounter uint64
 
+// maxBackendWeight bounds an operator-set capacity weight (negative, zero and absurd weights are rejected).
+const maxBackendWeight = 1000
+
 // quietRequestLog (LB_QUIET=1) suppresses the per-request log line so that
 // high-rate experiments do not spend CPU on logging.
 var quietRequestLog = os.Getenv("LB_QUIET") == "1"
@@ -96,15 +99,23 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 	}
 
 	return func(w http.ResponseWriter, r *http.Request) {
-		enableCORS(w)
-
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
+		sec := pool.Security()
+		if sec == nil {
+			enableCORS(w) // unhardened mode (unit tests only); main always installs a SecurityConfig
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		} else if r.Method == http.MethodOptions {
+			sec.preflight(w, r)
 			return
 		}
 
 		// API Routing
 		if strings.HasPrefix(r.URL.Path, "/api/") {
+			if sec != nil && !sec.checkAPI(w, r) {
+				return
+			}
 			handleAPI(w, r, pool, eventBus)
 			return
 		}
@@ -129,15 +140,19 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 		stratName := pool.GetStrategy().Name()
 
 		if !quietRequestLog {
-			log.Printf("[LoadBalancer] [%s] Forwarding %s %s -> %s (%s) (active: %d)",
-				reqID, r.Method, r.URL.Path, peer.Name, peer.URL, activeConns)
+			// the request path can carry identifiers: it is only logged when explicitly enabled
+			if sec != nil && sec.LogPath {
+				log.Printf("[LoadBalancer] [%s] Forwarding %s %s -> %s (active: %d)", reqID, r.Method, r.URL.Path, peer.Name, activeConns)
+			} else {
+				log.Printf("[LoadBalancer] [%s] Forwarding %s -> %s (active: %d)", reqID, r.Method, peer.Name, activeConns)
+			}
 		}
 
 		// Broadcast start event
 		eventBus.Publish(RequestEvent{
 			ID:          reqID,
 			Type:        "start",
-			ClientIP:    clientIP,
+			ClientIP:    sec.displayIP(clientIP),
 			BackendURL:  peer.URL.String(),
 			BackendName: peer.Name,
 			Strategy:    stratName,
@@ -179,7 +194,7 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 			eventBus.Publish(RequestEvent{
 				ID:          reqID,
 				Type:        "complete",
-				ClientIP:    clientIP,
+				ClientIP:    sec.displayIP(clientIP),
 				BackendURL:  peer.URL.String(),
 				BackendName: peer.Name,
 				Strategy:    stratName,
@@ -199,6 +214,7 @@ func lbHandler(pool *ServerPool, bus ...*EventBus) http.HandlerFunc {
 
 // handleAPI routes internal management and telemetry requests
 func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBus *EventBus) {
+	sec := pool.Security()
 	switch {
 	case r.URL.Path == "/api/status" && r.Method == http.MethodGet:
 		backends := pool.GetAllBackends()
@@ -267,6 +283,10 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		b := pool.GetBackendByName(body.Name)
 		if b == nil {
 			http.Error(w, "backend not found", http.StatusNotFound)
+			return
+		}
+		if body.Weight < 1 || body.Weight > maxBackendWeight {
+			http.Error(w, fmt.Sprintf("weight must be an integer in [1,%d]", maxBackendWeight), http.StatusBadRequest)
 			return
 		}
 		b.SetWeight(body.Weight)
@@ -344,6 +364,10 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		}
 		if len(body.Backend) > 64 || len(body.Detail) > maxEventDetail {
 			http.Error(w, "backend or detail too long", http.StatusBadRequest)
+			return
+		}
+		if body.Backend != "" && pool.GetBackendByName(body.Backend) == nil {
+			http.Error(w, "unknown backend", http.StatusBadRequest)
 			return
 		}
 		e := pool.Events().Add(body.Kind, body.Backend, body.Detail)
@@ -475,7 +499,15 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 
-		ch := eventBus.Subscribe()
+		maxSSE := 0
+		if s := pool.Security(); s != nil {
+			maxSSE = s.MaxSSE
+		}
+		ch, ok := eventBus.TrySubscribe(maxSSE)
+		if !ok {
+			http.Error(w, "too many event stream subscribers", http.StatusServiceUnavailable)
+			return
+		}
 		defer eventBus.Unsubscribe(ch)
 
 		// Send initial heartbeat
@@ -486,7 +518,10 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 			select {
 			case <-r.Context().Done():
 				return
-			case data := <-ch:
+			case data, open := <-ch:
+				if !open { // the bus was closed (shutdown)
+					return
+				}
 				fmt.Fprintf(w, "data: %s\n\n", data)
 				flusher.Flush()
 			}
@@ -518,7 +553,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 		eventBus.Publish(RequestEvent{
 			ID:          reqID,
 			Type:        "start",
-			ClientIP:    clientIP,
+			ClientIP:    sec.displayIP(clientIP),
 			BackendURL:  peer.URL.String(),
 			BackendName: peer.Name,
 			Strategy:    stratName,
@@ -552,7 +587,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request, pool *ServerPool, eventBu
 			eventBus.Publish(RequestEvent{
 				ID:          reqID,
 				Type:        "complete",
-				ClientIP:    clientIP,
+				ClientIP:    sec.displayIP(clientIP),
 				BackendURL:  peer.URL.String(),
 				BackendName: peer.Name,
 				Strategy:    stratName,

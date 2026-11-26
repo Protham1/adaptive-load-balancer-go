@@ -162,12 +162,24 @@ def archive_model(path: str) -> Optional[str]:
 class DecisionLog:
     """Append-only JSONL log; also keeps records in memory for tests/experiments."""
 
-    def __init__(self, path: Optional[str] = None, keep_in_memory: bool = True, max_memory: Optional[int] = None):
+    def __init__(self, path: Optional[str] = None, keep_in_memory: bool = True, max_memory: Optional[int] = None,
+                 max_bytes: Optional[int] = None, backups: int = 3):
         self.path = path
         self.records: list = [] if keep_in_memory else None
         self.max_memory = max_memory
+        self.max_bytes, self.backups = max_bytes, max(1, backups)  # file size bound: rotate to path.1 .. path.N
         if path:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+    def _rotate(self) -> None:
+        oldest = f"{self.path}.{self.backups}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(self.backups - 1, 0, -1):
+            src = f"{self.path}.{i}"
+            if os.path.exists(src):
+                os.replace(src, f"{self.path}.{i + 1}")
+        os.replace(self.path, f"{self.path}.1")
 
     def append(self, record: dict) -> None:
         if self.records is not None:
@@ -175,5 +187,14 @@ class DecisionLog:
             if self.max_memory and len(self.records) > self.max_memory:
                 del self.records[: len(self.records) - self.max_memory]
         if self.path:
+            line = json.dumps(record, default=float) + "\n"
+            if self.max_bytes and os.path.exists(self.path) and os.path.getsize(self.path) + len(line) > self.max_bytes:
+                self._rotate()
+            new = not os.path.exists(self.path)
             with open(self.path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, default=float) + "\n")
+                f.write(line)
+            if new:
+                try:
+                    os.chmod(self.path, 0o600)  # decision data is not world-readable (best effort on Windows)
+                except OSError:
+                    pass

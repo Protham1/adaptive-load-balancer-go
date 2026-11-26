@@ -492,7 +492,7 @@ type Policy struct {
 A live smoke test confirmed: `GET /api/policy` returns the mask `[true,true,true,false,true]`; `POST {"action":3}` → 400 with the reason; `POST {"action":4}` → 200 and the strategy switches; with too few samples the controller holds with reason `safe-policy retain: insufficient samples`.
 
 ### 8.7 Environment Note on the Race Detector
-`go test -race ./...` still cannot run on this machine (32-bit MinGW, see `BASELINE.md`). Phase 5/6 concurrency is covered by parallel tests (`TestConcurrentReadWrite`, `TestConcurrentPolicyUpdatesWhileSelecting`); they should be re-run under `-race` on a 64-bit GCC toolchain.
+`go test -race ./...` cannot run natively on this machine (32-bit MinGW, see `BASELINE.md`); **it was later run in a Linux container and passed (§23.3)**. Phase 5/6 concurrency is covered by parallel tests (`TestConcurrentReadWrite`, `TestConcurrentPolicyUpdatesWhileSelecting`); they should be re-run under `-race` on a 64-bit GCC toolchain.
 
 ### 8.8 Important Conclusions
 1. A fixed 5-action space with a validity mask removes an entire class of invalid agent behaviour.
@@ -677,7 +677,7 @@ Fixed-action mean reward per scenario (the reference table):
 * No reward-weight or `ref_throughput_rps` tuning on a real development workload; no live A/B comparison.
 * The simulator's strategy models are assumptions; CPU/memory are host-level on the live service.
 * The bandit assumes a stationary reward per (state, action) (no forgetting factor), and an action's reward includes switching transients that the settle period only partly removes.
-* `go test -race` still cannot run on this machine (32-bit MinGW); Python code has no shared mutable state across threads.
+* `go test -race` cannot run natively on this machine (32-bit MinGW); it was later run in a Linux container and passed (§23.3). Python code has no shared mutable state across threads.
 
 ---
 
@@ -772,7 +772,7 @@ The reason code is counted in `manager.reason_counts` and the *policy snapshot i
 ### 13.3 Verification
 `agent_controller_test.go` (fake clock/telemetry/agent, no sleeps): every rejection reason, apply-after-min-age, switch margin, shadow mode, adaptive weights reaching the request path, safety fallback and lockout, kill switch and resume, in-flight untouched, full evaluation cycle producing a `previous_outcome` with the right counter deltas, failure back-off, stale decisions, slow answers, unclean windows withheld. `TestConcurrentProposalsWhileServing` and `TestConcurrentPolicyUpdatesWhileSelecting` run proposals, fallbacks and selections concurrently.
 
-> **Race detector.** The plan asks for `go test -race` under load with switching enabled. This machine has only a 32-bit MinGW (`cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`), so **the race detector could not be run**; this remains an open item to run on a 64-bit toolchain. Concurrency is exercised by the tests above and by the live runs, but that is not a substitute.
+> **Race detector (update: run and clean in a Linux container, see §23.3).** The plan asks for `go test -race` under load with switching enabled. This machine has only a 32-bit MinGW (`cc1.exe: sorry, unimplemented: 64-bit mode not compiled in`), so **the race detector could not be run**; this remains an open item to run on a 64-bit toolchain. Concurrency is exercised by the tests above and by the live runs, but that is not a substitute.
 
 ---
 
@@ -1320,7 +1320,79 @@ Simulator-based control comparison (no live predictive run); the horizon is fixe
 
 ---
 
-## 23. Architectural Summary & Best Practices
+## 23. Security, Reliability and Operational Hardening
+
+The final phase audits the system against a threat model and the plan's hardening checklist, closes the gaps it finds, and proves each fix with a test that fails without it.
+
+**Threat model.** The management API and the learner API are for the *local operator and local tooling* (dashboard, load generator, the Python agent). They must not be reachable or drivable by (a) other machines, (b) a web page the operator happens to visit (CSRF, DNS rebinding against `localhost`), or (c) malformed, oversized or slow requests. The proxied traffic path is public by design and is not authenticated. TLS is out of scope (see §23.6).
+
+### 23.1 Checklist → what exists now
+| Requirement | Before this phase | Now | Verified by |
+| :--- | :--- | :--- | :--- |
+| **Bind the local AI API to loopback or a protected channel** | learner bound to `127.0.0.1` by default, but `--host 0.0.0.0` was accepted with no authentication | non-loopback bind is **refused** unless `--allow-remote` **and** `--auth-token` are given; every endpoint then requires a constant-time-compared bearer token; the Go client sends `LB_AGENT_TOKEN` | `ai/tests/test_hardening.py` (bind policy, auth on all endpoints, CLI refusal), live E17 |
+| *(same principle for the LB's own API)* | **`/api/*` (kill switch, reset, strategy, weights) was open to any host with `Access-Control-Allow-Origin: *` and no content-type check: any web page could POST to it (CSRF)** | mutating calls need a **bearer token (`LB_ADMIN_TOKEN`) or a loopback client address**; **Host allow-list** (defeats DNS rebinding); **Origin allow-list** (`LB_CORS_ORIGINS`, default the Vite dev server) with **no wildcard**; POST must be `Content-Type: application/json` (forces a CORS preflight); preflight answered for allowed origins only | `hardening_test.go` (loopback-only, token, CSRF, rebinding, content type, preflight), live E1–E3, E14–E16 |
+| *(fault-injection control port of the demo backends)* | listened on all interfaces, unauthenticated, can take a backend down | **loopback only** | `TestFaultControlPortListensOnLoopbackOnly` |
+| **Request-size limits** | learner 64 KiB; LB API bodies unlimited | LB API bodies ≤ **4 KiB** (413 beyond); learner 64 KiB (413), reset body 4 KiB; agent responses ≤ 64 KiB, learner view ≤ 512 KiB | unit + live E8 |
+| **Timeouts** | LB `http.Server` had none; learner none | LB: `ReadHeaderTimeout` 10 s, `IdleTimeout` 120 s, `MaxHeaderBytes` 64 KiB (no `WriteTimeout`: `/api/events` is a long-lived SSE stream, bounded by the subscriber cap); learner: per-connection socket timeout 10 s and a **connection cap** (16 → immediate 503); agent calls from Go keep the 2 s timeout | `TestServerTimeoutsAreConfigured`, learner slow-client and cap tests, live **E13 slowloris closed after 10.0 s** |
+| **Strict JSON decoding** | typed decoding that ignores unknown fields | LB: exactly **one JSON object**, **only the keys the endpoint defines** (unknown field → 400), trailing data → 400; learner: strict contract (unknown fields rejected at every level) and strict reset body | table-driven tests, live E6/E7 |
+| **Reject NaN/Infinity** | contract rejected them | additionally in every admin body (invalid JSON → 400); Python parses with `parse_constant` rejecting them and encodes with `allow_nan=False` | unit + live E7, C-nan |
+| **Reject negative weights** | AI weights bounded (0.05–0.80) but **`POST /api/backends/weight` accepted any integer, including negative and zero** | operator weights must be an integer in **[1, 1000]**; AI weights as before | `TestWeightsAndBackendIdentifiersAreValidated`, live E4/E5 |
+| **Reject unknown backend IDs** | AI weights and toggle/weight checked; markers accepted any name | markers must name a configured backend (or none); AI proposals naming unknown backends are rejected by the manager | unit + live E10 |
+| **Reject unsupported strategy names** | wire names validated on both sides | unchanged; plus admin strategy/action validation | unit + live E9, C-unknown_strategy |
+| **Bounded logs; no raw request data or personal identifiers** | decision logs grew without bound; the SSE event stream **published every client IP address** to any subscriber; the request path was logged | Go decision log: **rotating, 10 MiB × 3 backups, owner-only**; Python decision log: same bound; in-memory rings everywhere; client IPs in events are **masked** (`a.b.c.0`, IPv6 first three groups, non-IPs → `unknown`) unless `LB_EXPOSE_CLIENT_IP=1`; the request path is **not** logged unless `LB_LOG_REQUEST_PATH=1`; the agent URL is logged without credentials/query; the learner log is asserted to contain only the documented numeric fields (no `features`, timestamps of the request or backend names); SSE subscribers capped at 32 | `TestClientAddressesAreMaskedInEventsAndLogsOmitPaths`, `TestRotatingLogIsBounded`, `test_logs_contain_only_numeric_features_and_decision_metadata`, live E12 |
+| **AI controller optional; LB starts and serves with a baseline if Python fails** | true in design | proven: the LB serves immediately (0 failed requests) with the known-safe baseline when the agent was **never started**, is **killed mid-run**, **times out**, or **refuses its model** | `TestLBServesWithBaselineWhenTheAgentIsDown`, live A1–A7, B1 |
+| **Test restart, network timeout, malformed response, stale response, model-load failure** | partly (unit tests of the client) | all five exercised **against real processes** (§23.2) | `scripts/e2e_hardening.py` — 37 checks |
+| **Graceful shutdown; background goroutines stop cleanly** | none: no signal handling, every loop used `context.Background()` | `main` → `runLB(ctx, …)`: SIGINT/SIGTERM (Ctrl-C / Ctrl-Break) cancel one context; the HTTP server **drains in-flight requests** (grace 10 s); open **SSE streams are closed** so they cannot hold the shutdown; the rule controller, AI loop, history sampler and health checker all stop and are **waited for**; log file closed; demo backends stopped; exit code 0. The learner writes a final checkpoint on SIGINT/SIGTERM/SIGBREAK | `TestShutdownLetsInFlightRequestsFinish…`, `TestOpenEventStreamsDoNotBlockShutdown`, **`TestShutdownLeavesNoBackgroundGoroutines`**, live A6, D1–D2 |
+| **`go test -race ./...` + concurrent policy-swap integration tests** | race detector unavailable on the Windows host (32-bit MinGW); concurrency tests used the pool directly | race detector run in a Linux container (§23.3); new **HTTP-level integration test**: 8 concurrent clients while five concurrent swappers hit `/api/policy` (all actions + adaptive + AI-style decision IDs), `/api/strategy`, weight updates and markers | `TestConcurrentPolicySwapsWhileServingTrafficOverHTTP` |
+
+### 23.2 Failure testing against real processes (`scripts/e2e_hardening.py`, 37 checks, all pass)
+| Scenario | What the live run showed |
+| :--- | :--- |
+| **A. the agent is optional** | LB with the agent URL set but **no agent running**: 59/59 requests served, baseline policy, failures counted as `connect`; the agent started later is picked up **without restarting the LB**; **hard-killing the agent mid-run**: 0 failed requests, policy retained, failures counted; **agent restart**: decisions resume and the persisted model is restored (3 → 3 updates); **LB graceful stop** (exit 0) and **restart**: serves immediately and re-attaches to the agent |
+| **B. model-load failure** | corrupt model file: the agent answers HTTP 500 `model_incompatible` per decision, the LB counts `status` failures and keeps the baseline, the agent process stays up and healthy; `--on-incompatible reset` archives the unusable file and decisions succeed again |
+| **C. a misbehaving agent** (fake server) | **malformed JSON** → `malformed`; **stale decision ID** → `stale`; **slow (2 s vs 0.7 s timeout)** → `timeout`; **unknown strategy**, **NaN in scores**, **70 KB response** → `malformed`; **HTTP 500** → `status`. In every case the policy never changed from the baseline and no request failed |
+| **D. shutdown with a request in flight** | the in-flight 2 s request completes with 200; exit code 0 in 1.6 s; shutdown logged |
+| **E. attacks on the management API** | form-style POST → 415; cross-site Origin → 403; rebinding Host → 403; negative / 10⁹ weight, unknown field, NaN, unknown strategy, unknown backend, spoofed safety marker → 400; 6 KB body → 413; **SSE flood: 32 accepted, 8 refused (503)**; **slowloris closed at 10.0 s**; token mode: none/wrong → 401, right → 200; learner refuses a public bind |
+
+### 23.3 Race detector
+The race detector (`go test -race ./...`) cannot run on the Windows development machine (only a 32-bit MinGW compiler is installed; the detector needs a 64-bit C toolchain). It was therefore run in the official **`golang:1.27` Linux container** (Go 1.27.4, linux/amd64, cgo enabled, 12 CPUs) on a read-only copy of the repository, on the final code of this phase:
+
+* **The full suite passes with the race detector enabled in every package — exit code 0, no data race reported.**
+* The concurrency-sensitive tests (concurrent strategy switching, policy updates while selecting, proposals while serving, the HTTP-level concurrent policy-swap integration test, graceful-shutdown and goroutine-leak tests, the strategy and policy concurrency tests) were additionally **repeated 15 times each under the race detector — also clean**.
+
+```bash
+docker run --rm -v "$PWD":/src:ro golang:1.27 bash -c 'cp -r /src /work && cd /work && go test -race -count=1 ./...'
+```
+*Limits.* The detector reports races that occur in the schedules actually executed, so a clean result is strong evidence, not a proof; it covers the Go code only (the learner is a single process guarded by one lock); it reflects the code at the commit that carries this documentation and should be re-run after concurrency changes.
+
+### 23.4 Defects found by this audit
+| Defect | Severity | Fix |
+| :--- | :--- | :--- |
+| Management API reachable from any host and drivable from any web page (CSRF, wildcard CORS, no content-type check, no Host check) | **high** | §23.1 |
+| **A refused (incompatible or corrupt) model was overwritten by the shutdown checkpoint with an empty model — data loss.** Found by the live model-failure scenario (B3) | **high** | a service that has not loaded or has refused the existing model never writes a checkpoint; tests cover both a corrupt and a valid-but-incompatible model |
+| No graceful shutdown: no signal handling, goroutines on `context.Background()`, SSE streams would block a drain | medium | `runLB` (§23.1) |
+| Operator weight endpoint accepted negative and zero weights | medium | validated to [1, 1000] |
+| SSE event stream exposed client IP addresses; unbounded subscribers; unbounded log files; request paths logged | medium | masking, cap, rotation, path logging off by default |
+| No HTTP server timeouts (slowloris) on the LB and the learner | medium | §23.1 |
+| Demo-backend fault-control port on all interfaces | medium | loopback only |
+
+### 23.5 Configuration
+| Variable / flag | Default | Meaning |
+| :--- | :--- | :--- |
+| `LB_ADMIN_TOKEN` | unset ⇒ management API is loopback-only | bearer token for mutating calls (also allows remote administration) |
+| `LB_CORS_ORIGINS`, `LB_ALLOWED_HOSTS` | Vite dev origins; `localhost`, `127.0.0.1`, `::1` | origin / host allow-lists |
+| `LB_EXPOSE_CLIENT_IP=1`, `LB_LOG_REQUEST_PATH=1` | off | show raw client IPs in events / log request paths |
+| `LB_ADDR` | `:8080` | listen address |
+| `LB_DECISION_LOG`, `LB_DECISION_LOG_MAX_MB` | none, 10 | Go-side decision log (rotated, owner-only) |
+| `LB_AGENT_TOKEN`, `LB_AGENT_FAILURE_BACKOFF_S` | none, 10 | bearer token sent to the agent; pause after an agent failure |
+| `ai.server --auth-token` (`AI_AGENT_TOKEN`), `--allow-remote`, `--max-connections`, `--request-timeout`, `--log-max-mb` | none, off, 16, 10 s, 10 | learner API hardening |
+
+### 23.6 Residual risks and non-goals
+No TLS (run behind a TLS-terminating reverse proxy if the API is ever exposed beyond the host); bearer tokens are passed in environment variables/flags and are visible to other local users who can list process environments; there is no rate limiting beyond the size, timeout and connection caps; the proxied traffic path is unauthenticated by design; one learner instance per model file is assumed (no inter-process locking); the Windows `TerminateProcess` kill cannot run shutdown handlers (the per-update checkpoint bounds the loss to the in-flight window); the Docker/Linux race run covers the code as of the commit named in §23.3, not future changes.
+
+---
+
+## 24. Architectural Summary & Best Practices
 
 ```mermaid
 flowchart LR
@@ -1423,6 +1495,16 @@ flowchart LR
     Bandit --> Persist
     Bandit --> Drift
     Pred -.-> Bandit
+
+    subgraph Hardening["Hardening"]
+        Guard["Management API guard (loopback/token, Host+Origin allow-lists, strict bodies)"]
+        Shutdown["Graceful shutdown (context, drain, SSE close, goroutine wait)"]
+        Opt["AI optional: baseline serves if the agent fails"]
+    end
+
+    Guard --> API
+    Shutdown --> LB
+    Opt --> Manager
 ```
 
 ### Engineering Best Practices Implemented
@@ -1435,13 +1517,40 @@ flowchart LR
 
 ---
 
-## 24. Next Steps & Road Ahead
+## 25. Next Steps & Road Ahead
 
 * **Look at the dashboard in a browser** and fix layout/readability issues (only the data layer, component tree and endpoints were verified); consider zoom/pan and SSE instead of polling.
-* **Validate the drift thresholds** (Page-Hinkley, PSI) on genuinely drifting live workloads, and decide what policy (if any) should follow a drift flag.
-* **Extend the matrix to the plan's minimum of 5 repetitions** (`--reps 5`, resumable) and beyond (≥ 6 pairs are needed for any paired test to reach p < 0.05); then re-read §19.6 under the claim rule.
+* **Extend the experiment matrix to the plan's minimum of 5 repetitions** (`--reps 5`, resumable) and beyond (≥ 6 pairs are needed for any paired test to reach p < 0.05); then re-read §19.6 under the claim rule.
+* **Give the AI a fair, longer test:** a pre-trained / warm-started arm and longer runs, so the comparison measures a converged learner; enforce affinity on affinity workloads through the action mask.
 * **Recalibrate E8** (and hence E9/E10) so that the mixed scenario does not saturate every policy; re-run the ablation and the interval sweep.
-* **Warm-start / pre-trained AI arm and longer horizons**, so the comparison measures a converged learner; enforce affinity on affinity workloads through the action mask.
+* **Tune and freeze the thresholds** (Phase 12 safety, reward weights, drift) on development scenarios; validate the drift detectors on genuinely drifting live workloads; add per-backend (process-level) CPU/memory metrics.
 * **Predictive layer, only if revisited:** send a short per-second history in the decision contract and re-test on live traces; the current evidence (§22) says it does not help.
-* **Run the Go race detector** (`go test -race ./...`) on a 64-bit toolchain, including under load with policy switching enabled (still not possible on the current machine).
-* **Tune the Phase 12 safety thresholds and the reward weights on development scenarios**, freeze them, and report them in the experimental setup; add per-backend resource metrics (process-level CPU/memory).
+* **If the API is ever exposed beyond the host:** put it behind a TLS-terminating reverse proxy, add rate limiting, and keep tokens out of process environments (§23.6).
+* **Re-run `go test -race ./...`** (Linux container or a 64-bit toolchain) after any concurrency change.
+
+---
+
+## 26. Project Summary and Conclusions
+
+### 26.1 What was built
+An adaptive HTTP load balancer in Go with a separate Python learner, developed in 21 steps: a trusted baseline and metrics contract (Phases 0–4), a rule-based adaptive baseline and an immutable policy/action design (5–6), a bounded reward, a contextual-bandit learner, an offline simulator and a promotion gate (7–9), a versioned Go⇄Python contract with a policy manager, safety layer and kill switch (10–12), fault injection and an open-loop workload generator (13), a reproducible experiment pipeline with a 180-run matrix and a statistics layer with an explicit claim rule (14–17), a research dashboard, persistent and drift-aware online learning and an optional predictive layer (18–20), and a security and reliability hardening pass (§23).
+
+### 26.2 What the evidence supports
+* **The system is operationally sound.** The load balancer serves with a known-safe baseline whether or not the AI is available; every proposal passes a policy manager, hysteresis and a safety fallback; failures of the agent (down, slow, malformed, stale, refusing its model) never reached the request path in 37 live checks; the race detector found no data race; shutdown is graceful and leak-free.
+* **Which fixed policy is best depends on the scenario** (Phase 17 matrix, 180 valid runs, 3 repetitions): Least Connections under CPU pressure or added latency, static weighted round robin under long requests, anything but Round Robin under heterogeneous capacity or flash crowds; detection of a failed backend is ~1 s (the health-check interval), traffic returns 3–4 s after restoration.
+* **The AI was not shown to beat the best fixed baseline anywhere.** In 36 s cold-start runs it matched static SWRR (it starts there and rarely switches), was worse under long requests (exploration cost), and did not find Least Connections in time where that is clearly best. In the offline simulator the contextual learners beat random, Round Robin, static SWRR, rule-based and the non-contextual bandit, but not always-LC. Statistically, 3 repetitions cannot support any "better/worse" claim (smallest attainable p = 0.25), so the tables are descriptive.
+* **Prediction did not help** (Phase 20): simple forecasters were usually worse than "last value", and acting on them did not improve the objective (30 paired simulator seeds; one arm slightly worse).
+* **The honest negative results are findings, not failures:** they show where an adaptive controller's value is bounded and what a convincing demonstration would need.
+
+### 26.3 What the project did not establish (limits)
+Convergence of a trained learner (every run started untrained); performance on real, drifting, multi-machine workloads (one 12-thread laptop shared by generator, LB, backends and agent); statistical power (n = 3 vs the plan's minimum of 5, and ≥ 6 for any paired test to reach p < 0.05); the mixed scenario E8 saturates every policy and needs recalibration; drift thresholds, safety thresholds and reward weights were set a priori, not tuned on development scenarios; CPU and memory are host-level readings; the dashboard was verified through its data layer, component tree and endpoints but not looked at in a browser; TLS and rate limiting are out of scope.
+
+### 26.4 Reproducing the work
+```bash
+go test ./... && python -m pytest ai/tests experiments/tests -q && (cd frontend && npm test)   # unit / integration tests
+python scripts/e2e_checks.py && python scripts/e2e_dashboard.py && python scripts/e2e_hardening.py   # live checks against real processes
+python -m experiments.runner.matrix --experiments all --reps 3 && python -m experiments.analysis.report   # the experiment matrix
+python -m ai.experiments && python -m ai.predict_eval                                             # simulator studies (Phases 9, 20)
+docker run --rm -v "$PWD":/src:ro golang:1.27 bash -c 'cp -r /src /work && cd /work && go test -race ./...'   # race detector
+```
+Every experiment run records its commit, hardware, versions, seed and configuration; `documentation.md` sections 1–23 document the design, the data and the defects found along the way.
